@@ -1,0 +1,4 @@
+kaggle
+qdrant-client
+sentence-transformers
+pandas
