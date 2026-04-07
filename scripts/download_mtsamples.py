@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 DATASET = "tboyle10/medicaltranscriptions"
-DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "mtsamples"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "kaggle" / "mtsamples"
 
 
 def main():
