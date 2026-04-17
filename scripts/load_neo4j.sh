@@ -68,6 +68,7 @@ CREATE CONSTRAINT concept_cui_unique IF NOT EXISTS FOR (c:Concept) REQUIRE c.cui
 CREATE CONSTRAINT semtype_tui_unique IF NOT EXISTS FOR (s:SemanticType) REQUIRE s.tui IS UNIQUE;
 CREATE CONSTRAINT source_sab_unique  IF NOT EXISTS FOR (s:Source) REQUIRE s.sab IS UNIQUE;
 CREATE INDEX concept_name IF NOT EXISTS FOR (c:Concept) ON (c.name);
+CREATE FULLTEXT INDEX concept_name_fts IF NOT EXISTS FOR (c:Concept) ON EACH [c.name];
 CYPHER
 
 echo "done. Browser: http://localhost:7474 (neo4j / $NEO4J_PASSWORD)"
