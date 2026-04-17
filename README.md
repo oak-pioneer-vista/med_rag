@@ -26,13 +26,20 @@ python scripts/download_mtsamples.py
 
 Downloads the [MTSamples](https://www.kaggle.com/datasets/tboyle10/medicaltranscriptions) dataset into `data/mtsamples/`.
 
-### 2. Start Qdrant
+### 2. Start Qdrant and Neo4j
 
 ```bash
 docker compose up -d
 ```
 
-Runs Qdrant on `localhost:6333` (REST) and `localhost:6334` (gRPC). Data is persisted in a Docker volume.
+- Qdrant on `localhost:6333` (REST) and `localhost:6334` (gRPC).
+- Neo4j on `localhost:7474` (Browser) and `localhost:7687` (Bolt). Default credentials: `neo4j` / `medragpass` (override via `NEO4J_USER` / `NEO4J_PASSWORD`).
+
+Data for both is persisted in Docker volumes. Verify the Neo4j connection with:
+
+```bash
+python scripts/neo4j_smoke_test.py
+```
 
 ### 3. Ingest into Qdrant
 
@@ -41,3 +48,22 @@ python scripts/ingest_mtsamples.py
 ```
 
 Embeds medical transcriptions using `all-MiniLM-L6-v2` and upserts them into a `mtsamples` Qdrant collection with metadata (specialty, description, keywords).
+
+### 4. Ingest UMLS into Neo4j
+
+Two-step pipeline: convert RRF files to admin-import CSVs, then bulk-load.
+
+```bash
+# Convert (parallel; defaults to CPU count). ~70s on 32 cores for UMLS 2025AB.
+python scripts/umls_to_neo4j_csv.py \
+    --meta data/datasets/umls-2025AB-metathesaurus-full1/2025AB/META \
+    --out  data/neo4j_import \
+    --english-only --drop-suppressed --workers 32
+
+# Bulk-load. Stops neo4j, runs neo4j-admin import, restarts. ~25s.
+bash scripts/load_neo4j.sh
+```
+
+Result: ~3.3M `Concept` nodes and ~84.6M relationships (`IS_A`, `RELATES`, `HAS_SEMTYPE`, `DEFINED_BY`) plus `SemanticType` and `Source` nodes. See the docstring in `scripts/umls_to_neo4j_csv.py` for the graph model.
+
+A pre-built snapshot of the imported store is at `gs://med_rag/neo4j_processed/neo4j_data.tar.zst` (~900 MB) — restore by extracting into the `med_rag_neo4j_data` Docker volume with neo4j stopped.

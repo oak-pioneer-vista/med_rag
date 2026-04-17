@@ -9,5 +9,20 @@ services:
     environment:
       - QDRANT__SERVICE__GRPC_PORT=6334
 
+  neo4j:
+    image: neo4j:5
+    ports:
+      - "7474:7474" # HTTP / Browser
+      - "7687:7687" # Bolt
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - ./data/neo4j_import:/import
+    environment:
+      - NEO4J_AUTH=neo4j/medragpass
+      - NEO4J_PLUGINS=["apoc"]
+
 volumes:
   qdrant_data:
+  neo4j_data:
+  neo4j_logs:
