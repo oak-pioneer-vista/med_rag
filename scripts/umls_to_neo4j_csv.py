@@ -37,6 +37,7 @@ Then bulk-load (Neo4j 5 syntax):
 
 import argparse
 import csv
+import html
 import multiprocessing as mp
 import os
 import shutil
@@ -126,7 +127,7 @@ def _chunk_concepts(args):
                 continue
             if drop_suppressed and fields[ix["SUPPRESS"]] in SUPPRESSED:
                 continue
-            w.writerow([cui, fields[ix["STR"]], "Concept"])
+            w.writerow([cui, html.unescape(fields[ix["STR"]]), "Concept"])
             seen.add(cui)
     return part
 
@@ -146,8 +147,8 @@ def _chunk_semtypes(args):
                 continue
             if tui not in local_tuis:
                 local_tuis.add(tui)
-                nw.writerow([tui, fields[ix["STY"]], fields[ix["STN"]],
-                             "SemanticType"])
+                nw.writerow([tui, html.unescape(fields[ix["STY"]]),
+                             fields[ix["STN"]], "SemanticType"])
             rw.writerow([cui, tui, "HAS_SEMTYPE"])
     return node_part, rel_part
 
@@ -214,7 +215,8 @@ def _chunk_defs(args):
                 continue
             if drop_suppressed and fields[ix["SUPPRESS"]] in SUPPRESSED:
                 continue
-            w.writerow([cui, sab, fields[ix["DEF"]], "DEFINED_BY"])
+            w.writerow([cui, sab, html.unescape(fields[ix["DEF"]]),
+                        "DEFINED_BY"])
     return part
 
 
@@ -274,7 +276,8 @@ def write_sources_serial(meta: Path, out: Path) -> set:
                 sab = fields[3]  # RSAB
                 if not sab or sab in seen:
                     continue
-                w.writerow([sab, fields[4], fields[6], "Source"])  # SON, SVER
+                w.writerow([sab, html.unescape(fields[4]), fields[6],
+                            "Source"])  # SON, SVER
                 seen.add(sab)
     return seen
 

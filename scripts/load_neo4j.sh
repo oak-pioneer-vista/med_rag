@@ -63,7 +63,7 @@ until docker exec "$CONTAINER" cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETUR
 done
 
 echo "==> creating constraints and indexes"
-docker exec "$CONTAINER" cypher-shell -u neo4j -p "$NEO4J_PASSWORD" <<'CYPHER'
+docker exec -i "$CONTAINER" cypher-shell -u neo4j -p "$NEO4J_PASSWORD" <<'CYPHER'
 CREATE CONSTRAINT concept_cui_unique IF NOT EXISTS FOR (c:Concept) REQUIRE c.cui IS UNIQUE;
 CREATE CONSTRAINT semtype_tui_unique IF NOT EXISTS FOR (s:SemanticType) REQUIRE s.tui IS UNIQUE;
 CREATE CONSTRAINT source_sab_unique  IF NOT EXISTS FOR (s:Source) REQUIRE s.sab IS UNIQUE;
