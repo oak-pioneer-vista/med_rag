@@ -54,4 +54,20 @@ docker compose run --rm --no-deps --entrypoint neo4j-admin "$SERVICE" \
 echo "==> starting $SERVICE"
 docker compose up -d "$SERVICE"
 
-echo "done. Browser: http://localhost:7474 (neo4j / medragpass)"
+NEO4J_PASSWORD="${NEO4J_PASSWORD:-medragpass}"
+CONTAINER="med_rag-${SERVICE}-1"
+
+echo "==> waiting for bolt"
+until docker exec "$CONTAINER" cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETURN 1" >/dev/null 2>&1; do
+    sleep 2
+done
+
+echo "==> creating constraints and indexes"
+docker exec "$CONTAINER" cypher-shell -u neo4j -p "$NEO4J_PASSWORD" <<'CYPHER'
+CREATE CONSTRAINT concept_cui_unique IF NOT EXISTS FOR (c:Concept) REQUIRE c.cui IS UNIQUE;
+CREATE CONSTRAINT semtype_tui_unique IF NOT EXISTS FOR (s:SemanticType) REQUIRE s.tui IS UNIQUE;
+CREATE CONSTRAINT source_sab_unique  IF NOT EXISTS FOR (s:Source) REQUIRE s.sab IS UNIQUE;
+CREATE INDEX concept_name IF NOT EXISTS FOR (c:Concept) ON (c.name);
+CYPHER
+
+echo "done. Browser: http://localhost:7474 (neo4j / $NEO4J_PASSWORD)"
