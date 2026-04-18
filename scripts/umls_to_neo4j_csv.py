@@ -9,9 +9,11 @@ for relationship files.
 Graph model:
 
     (Concept      {cui, name})
+    (Atom         {aui, sab, code, tty, str})
     (SemanticType {tui, name, tree_number})
     (Source       {sab, name, version})
 
+    (Concept)-[:HAS_ATOM]->(Atom)                         # from MRCONSO
     (Concept)-[:HAS_SEMTYPE]->(SemanticType)
     (Concept)-[:RELATES {rel, rela, sab}]->(Concept)     # from MRREL
     (Concept)-[:IS_A {sab, rela}]->(Concept)              # from MRHIER
@@ -26,8 +28,10 @@ Usage:
 Then bulk-load (Neo4j 5 syntax):
     neo4j-admin database import full \\
         --nodes=/import/concepts.csv \\
+        --nodes=/import/atoms.csv \\
         --nodes=/import/semantic_types.csv \\
         --nodes=/import/sources.csv \\
+        --relationships=/import/concept_atom.csv \\
         --relationships=/import/concept_semtype.csv \\
         --relationships=/import/concept_relates.csv \\
         --relationships=/import/concept_parent.csv \\
@@ -130,6 +134,33 @@ def _chunk_concepts(args):
             w.writerow([cui, html.unescape(fields[ix["STR"]]), "Concept"])
             seen.add(cui)
     return part
+
+
+def _chunk_atoms(args):
+    """Emit (Atom) nodes and (Concept)-[:HAS_ATOM]->(Atom) rels per chunk.
+
+    AUI is unique per MRCONSO row, so no dedup is needed across chunks.
+    """
+    meta, start, end, atom_part, rel_part, english_only, drop_suppressed = args
+    with atom_part.open("w", encoding="utf-8", newline="") as af, \
+            rel_part.open("w", encoding="utf-8", newline="") as rf:
+        aw = csv.writer(af)
+        rw = csv.writer(rf)
+        for fields, ix in iter_rrf_range(meta / "MRCONSO.RRF",
+                                         MRCONSO_COLS, start, end):
+            cui = fields[ix["CUI"]]
+            if cui not in _concepts:
+                continue
+            if english_only and fields[ix["LAT"]] != "ENG":
+                continue
+            if drop_suppressed and fields[ix["SUPPRESS"]] in SUPPRESSED:
+                continue
+            aui = fields[ix["AUI"]]
+            aw.writerow([aui, fields[ix["SAB"]], fields[ix["CODE"]],
+                         fields[ix["TTY"]],
+                         html.unescape(fields[ix["STR"]]), "Atom"])
+            rw.writerow([cui, aui, "HAS_ATOM"])
+    return atom_part, rel_part
 
 
 def _chunk_semtypes(args):
@@ -307,6 +338,28 @@ def phase_concepts(meta, out, parts_dir, workers, ctx, english_only, drop_suppre
           f"[{time.monotonic()-t0:.1f}s]")
 
 
+def phase_atoms(meta, out, parts_dir, workers, ctx, english_only, drop_suppressed):
+    t0 = time.monotonic()
+    offsets = split_offsets(meta / "MRCONSO.RRF", workers)
+    tasks = [(meta, s, e,
+              parts_dir / f"atoms_nodes.{i}.csv",
+              parts_dir / f"atoms_rels.{i}.csv",
+              english_only, drop_suppressed)
+             for i, (s, e) in enumerate(offsets)]
+    results = run_pool(ctx, workers, _chunk_atoms, tasks)
+    node_parts = [r[0] for r in results]
+    rel_parts = [r[1] for r in results]
+    node_rows = concat_parts(
+        node_parts, out / "atoms.csv",
+        ["aui:ID(Atom)", "sab", "code", "tty", "str", ":LABEL"])
+    rel_rows = concat_parts(
+        rel_parts, out / "concept_atom.csv",
+        [":START_ID(Concept)", ":END_ID(Atom)", ":TYPE"])
+    print(f"atoms.csv               {node_rows:>12,} rows  "
+          f"[{time.monotonic()-t0:.1f}s]")
+    print(f"concept_atom.csv        {rel_rows:>12,} rows")
+
+
 def phase_semtypes(meta, out, parts_dir, workers, ctx):
     t0 = time.monotonic()
     offsets = split_offsets(meta / "MRSTY.RRF", workers)
@@ -429,6 +482,11 @@ def main():
     # Phase 2: sources — small file, serial; populates _sources.
     _sources = write_sources_serial(args.meta, args.out)
     print(f"sources.csv             {len(_sources):>12,} rows")
+
+    # Phase 2.5: atoms — second pass over MRCONSO with the same filters,
+    # preserving per-source codes/strings/TTYs that phase_concepts collapsed.
+    phase_atoms(args.meta, args.out, parts_dir, workers, ctx,
+                args.english_only, args.drop_suppressed)
 
     # Phase 3: semantic types.
     phase_semtypes(args.meta, args.out, parts_dir, workers, ctx)

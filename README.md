@@ -64,6 +64,6 @@ python scripts/umls_to_neo4j_csv.py \
 bash scripts/load_neo4j.sh
 ```
 
-Result: ~3.3M `Concept` nodes and ~84.6M relationships (`IS_A`, `RELATES`, `HAS_SEMTYPE`, `DEFINED_BY`) plus `SemanticType` and `Source` nodes. See the docstring in `scripts/umls_to_neo4j_csv.py` for the graph model.
+Result: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO row, carrying source code/TTY/string), and ~93.7M relationships (`HAS_ATOM`, `IS_A`, `RELATES`, `HAS_SEMTYPE`, `DEFINED_BY`) plus `SemanticType` and `Source` nodes. See the docstring in `scripts/umls_to_neo4j_csv.py` for the graph model.
 
 A pre-built snapshot of the imported store is at `gs://med_rag/neo4j_processed/neo4j_data.tar.zst` (~900 MB) — restore by extracting into the `med_rag_neo4j_data` Docker volume with neo4j stopped.
