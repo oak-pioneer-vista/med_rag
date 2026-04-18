@@ -78,4 +78,23 @@ CREATE FULLTEXT INDEX concept_name_fts IF NOT EXISTS FOR (c:Concept) ON EACH [c.
 CREATE FULLTEXT INDEX atom_str_fts IF NOT EXISTS FOR (a:Atom) ON EACH [a.str];
 CYPHER
 
+echo "==> applying tier labels (ClinicalCore / ClinicalSupport / Peripheral)"
+docker exec -i "$CONTAINER" cypher-shell -u neo4j -p "$NEO4J_PASSWORD" <<'CYPHER'
+MATCH (c:Concept)-[:HAS_SEMTYPE]->(s:SemanticType)
+WHERE s.name IN ['Disease or Syndrome','Pharmacologic Substance',
+                 'Therapeutic or Preventive Procedure',
+                 'Body Part, Organ, or Organ Component']
+WITH DISTINCT c
+CALL { WITH c SET c:ClinicalCore } IN TRANSACTIONS OF 50000 ROWS;
+
+MATCH (c:Concept)-[:HAS_SEMTYPE]->(s:SemanticType)
+WHERE s.name IN ['Medical Device','Laboratory or Test Result','Finding','Food']
+WITH DISTINCT c
+CALL { WITH c SET c:ClinicalSupport } IN TRANSACTIONS OF 50000 ROWS;
+
+MATCH (c:Concept)
+WHERE NOT c:ClinicalCore AND NOT c:ClinicalSupport
+CALL { WITH c SET c:Peripheral } IN TRANSACTIONS OF 50000 ROWS;
+CYPHER
+
 echo "done. Browser: http://localhost:7474 (neo4j / $NEO4J_PASSWORD)"
