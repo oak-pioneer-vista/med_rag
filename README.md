@@ -66,4 +66,10 @@ bash scripts/load_neo4j.sh
 
 Result: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO row, carrying source code/TTY/string), and ~93.7M relationships (`HAS_ATOM`, `IS_A`, `RELATES`, `HAS_SEMTYPE`, `DEFINED_BY`) plus `SemanticType` and `Source` nodes. See the docstring in `scripts/umls_to_neo4j_csv.py` for the graph model.
 
+`load_neo4j.sh` also creates indexes/constraints (`Concept.cui`, `Atom.aui`, `SemanticType.tui`, `Source.sab` uniqueness; `(Atom.sab, Atom.code)` range; `Concept.name` and `Atom.str` fulltext) and applies three semantic-type-derived labels to Concept nodes for query routing:
+
+- `:ClinicalCore` — Disease/Drug/Procedure/Anatomy (~735K nodes)
+- `:ClinicalSupport` — Device/Lab/Finding/Food (~418K nodes)
+- `:Peripheral` — everything else (~2.15M nodes)
+
 A pre-built snapshot of the imported store is at `gs://med_rag/neo4j_processed/neo4j_data.tar.zst` (~900 MB) — restore by extracting into the `med_rag_neo4j_data` Docker volume with neo4j stopped.
