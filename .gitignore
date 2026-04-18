@@ -1,5 +1,7 @@
 data/*
 !data/README.md
+!data/specialty_cui.json
+!data/doctype_cui.json
 .venv/
 __pycache__/
 *.pyc

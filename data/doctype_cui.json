@@ -1,0 +1,64 @@
+{
+  "_comment": "Doctype CUI assignment for MTSamples docs. Two layers: (a) explicit_by_specialty maps the 8 MTSamples medical_specialty values that are actually document categories (not specialties) directly to their UMLS doctype CUI. (b) rules fire in order over the doc's section headings when specialty_cui is set but doctype_cui is not; first rule whose any_of overlap with the doc's section_types by >= min_hits wins. See python/ingestion/parse_mtsamples.py.",
+  "explicit_by_specialty": {
+    "Autopsy": "C1548372",
+    "Consult - History and Phy.": "C1317420",
+    "Discharge Summary": "C0743221",
+    "Emergency Room Reports": "C1548376",
+    "IME-QME-Work Comp etc.": "C4277662",
+    "Letters": "C0746461",
+    "Office Notes": "C5890232",
+    "SOAP / Chart / Progress Notes": "C0747978"
+  },
+  "rules": [
+    {
+      "cui": "C0743221",
+      "name": "Discharge summary",
+      "any_of": [
+        "DISCHARGE DIAGNOSES", "DISCHARGE DIAGNOSIS",
+        "DISCHARGE MEDICATIONS", "DISCHARGE CONDITION",
+        "DISCHARGE INSTRUCTIONS", "HOSPITAL COURSE"
+      ],
+      "min_hits": 1
+    },
+    {
+      "cui": "C1269801",
+      "name": "Operative report",
+      "any_of": [
+        "PREOPERATIVE DIAGNOSIS", "PREOPERATIVE DIAGNOSES",
+        "POSTOPERATIVE DIAGNOSIS", "POSTOPERATIVE DIAGNOSES",
+        "PROCEDURE PERFORMED", "PROCEDURES PERFORMED",
+        "OPERATION PERFORMED", "TITLE OF OPERATION",
+        "DESCRIPTION OF OPERATION", "DESCRIPTION OF PROCEDURE",
+        "OPERATIVE PROCEDURE", "PROCEDURE IN DETAIL",
+        "ESTIMATED BLOOD LOSS", "ANESTHESIA"
+      ],
+      "min_hits": 2
+    },
+    {
+      "cui": "C1299496",
+      "name": "Radiology report",
+      "any_of": [
+        "FINDINGS", "IMPRESSION", "REASON FOR EXAM", "TECHNIQUE", "INDICATIONS"
+      ],
+      "min_hits": 2
+    },
+    {
+      "cui": "C0747978",
+      "name": "Progress note",
+      "any_of": ["SUBJECTIVE", "OBJECTIVE"],
+      "min_hits": 2
+    },
+    {
+      "cui": "C1317420",
+      "name": "History and physical note",
+      "any_of": [
+        "CHIEF COMPLAINT", "REASON FOR CONSULTATION", "REASON FOR VISIT",
+        "HISTORY OF PRESENT ILLNESS", "HPI",
+        "REVIEW OF SYSTEMS", "PAST MEDICAL HISTORY", "PMH",
+        "PHYSICAL EXAMINATION", "PHYSICAL EXAM"
+      ],
+      "min_hits": 3
+    }
+  ]
+}

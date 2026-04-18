@@ -1,37 +1,40 @@
-"""Parse MTSamples transcriptions into section-level records.
+"""Parse MTSamples transcriptions into per-doc MTSampleDoc JSON files.
 
 MTSamples encodes notes inline ("SUBJECTIVE:, ... MEDICATIONS: , ..."),
 so we carve each document on ALL-CAPS "HEADING:" tokens, keeping only
 headings that appear in the cleaned allowlist at data/mt_section_headings.txt
-(produced by extract_mt_headings.py).
-
-Two stages:
-  1) Per-document JSON with a `sections` list of Section objects.
-  2) Section JSON (one per section, flattened), ready for embedding + NER.
+(produced by extract_mt_headings.py). Rows are streamed through a
+`dask.bag` partitioned across worker processes; each worker loads config
+once per partition and writes one intermediate JSON doc under
+data/mtsamples_docs/ so downstream stages (embedding, NER, indexing)
+can fan out per file.
 
 `doc_id` matches the row position after dropna(transcription), so it lines
 up with the point ids in `ingest_mtsamples.py`.
 
 Outputs:
-  - data/mtsamples_parsed.jsonl
-  - data/mtsamples_chunks.jsonl
+  - data/mtsamples_docs/{doc_id:04d}.json  (one file per MTSampleDoc)
 
 Usage:
-  python python/ingestion/parse_mtsamples.py
+  python python/ingestion/parse_mtsamples.py [--workers 16]
 """
 
+import argparse
 import json
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Iterable
 
+import dask.bag as db
 import pandas as pd
 
 REPO = Path(__file__).resolve().parent.parent.parent
 SRC_CSV = REPO / "data" / "kaggle" / "mtsamples" / "mtsamples.csv"
 HEADINGS_FILE = REPO / "data" / "mt_section_headings.txt"
-OUT_PARSED = REPO / "data" / "mtsamples_parsed.jsonl"
-OUT_CHUNKS = REPO / "data" / "mtsamples_chunks.jsonl"
+SPECIALTY_CUI_FILE = REPO / "data" / "specialty_cui.json"
+DOCTYPE_CUI_FILE = REPO / "data" / "doctype_cui.json"
+OUT_DIR = REPO / "data" / "mtsamples_docs"
 
 HEADING_RE = re.compile(r"\b([A-Z][A-Z0-9 ,/&'\-]{2,78}):")
 MAX_WORDS = 8
@@ -57,9 +60,47 @@ class MTSampleDoc:
     description: str
     specialty: str
     specialty_cui: str
+    doctype_cui: str
     sample_name: str
     keywords: str
     sections: list[Section] = field(default_factory=list)
+
+
+def load_specialty_cui() -> dict[str, str]:
+    raw = json.loads(SPECIALTY_CUI_FILE.read_text(encoding="utf-8"))
+    return {k: v for k, v in raw.items() if not k.startswith("_")}
+
+
+def load_doctype_config() -> tuple[dict[str, str], list[dict]]:
+    raw = json.loads(DOCTYPE_CUI_FILE.read_text(encoding="utf-8"))
+    explicit = raw.get("explicit_by_specialty", {})
+    rules = [
+        {"cui": r["cui"], "any_of": set(r["any_of"]), "min_hits": int(r.get("min_hits", 1))}
+        for r in raw.get("rules", [])
+    ]
+    return explicit, rules
+
+
+def infer_doctype_cui(
+    specialty: str,
+    section_types: set[str],
+    explicit: dict[str, str],
+    rules: list[dict],
+) -> str:
+    """Return a doctype CUI.
+
+    Priority: explicit specialty->doctype mapping (the 8 MTSamples report
+    categories) beats heuristic rules over section headings. Rules fire in
+    declared order; first rule whose `any_of` overlaps `section_types` by
+    at least `min_hits` wins.
+    """
+    cui = explicit.get(specialty)
+    if cui:
+        return cui
+    for rule in rules:
+        if len(rule["any_of"] & section_types) >= rule["min_hits"]:
+            return rule["cui"]
+    return ""
 
 
 def load_allowed_headings() -> set[str]:
@@ -130,45 +171,84 @@ def parse_sections(
     ]
 
 
-def main() -> None:
+def _process_one(
+    task: tuple[int, dict],
+    allowed: set[str],
+    specialty_cui_map: dict[str, str],
+    doctype_explicit: dict[str, str],
+    doctype_rules: list[dict],
+) -> tuple[int, str, str, bool]:
+    """Parse one CSV row and write its MTSampleDoc JSON file.
+
+    Returns (doc_id, specialty, doctype_cui, specialty_unmapped) so the
+    driver can aggregate stats without re-reading the written files.
+    """
+    doc_id, row = task
+    specialty = str(row.get("medical_specialty") or "").strip()
+    keywords = str(row.get("keywords") or "").strip()
+    spec_cui = specialty_cui_map.get(specialty, "")
+    sections = parse_sections(
+        row["transcription"],
+        allowed,
+        doc_id=doc_id,
+        specialty=specialty,
+        specialty_cui=spec_cui,
+        keywords=keywords,
+    )
+    doctype_cui = infer_doctype_cui(
+        specialty,
+        {s.section_type for s in sections},
+        doctype_explicit,
+        doctype_rules,
+    )
+    doc = MTSampleDoc(
+        doc_id=doc_id,
+        description=str(row.get("description") or "").strip(),
+        specialty=specialty,
+        specialty_cui=spec_cui,
+        doctype_cui=doctype_cui,
+        sample_name=str(row.get("sample_name") or "").strip(),
+        keywords=keywords,
+        sections=sections,
+    )
+    path = OUT_DIR / f"{doc_id:04d}.json"
+    path.write_text(json.dumps(asdict(doc), ensure_ascii=False), encoding="utf-8")
+    return doc_id, specialty, doctype_cui, specialty not in specialty_cui_map
+
+
+def _process_partition(partition: Iterable[tuple[int, dict]]) -> list[tuple]:
+    """Dask worker entry point: load config once, process every row in this partition."""
     allowed = load_allowed_headings()
-    print(f"loaded {len(allowed)} allowed headings")
+    specialty_cui_map = load_specialty_cui()
+    doctype_explicit, doctype_rules = load_doctype_config()
+    return [
+        _process_one(task, allowed, specialty_cui_map, doctype_explicit, doctype_rules)
+        for task in partition
+    ]
 
-    df = pd.read_csv(SRC_CSV)
-    df = df.dropna(subset=["transcription"]).reset_index(drop=True)
-    print(f"processing {len(df)} records")
 
-    OUT_PARSED.parent.mkdir(parents=True, exist_ok=True)
-    n_chunks = 0
-    with OUT_PARSED.open("w", encoding="utf-8") as out_parsed, \
-         OUT_CHUNKS.open("w", encoding="utf-8") as out_chunks:
-        for doc_id, row in df.iterrows():
-            specialty = str(row.get("medical_specialty") or "").strip()
-            keywords = str(row.get("keywords") or "").strip()
-            doc = MTSampleDoc(
-                doc_id=int(doc_id),
-                description=str(row.get("description") or "").strip(),
-                specialty=specialty,
-                specialty_cui="",
-                sample_name=str(row.get("sample_name") or "").strip(),
-                keywords=keywords,
-                sections=parse_sections(
-                    row["transcription"],
-                    allowed,
-                    doc_id=int(doc_id),
-                    specialty=specialty,
-                    specialty_cui="",
-                    keywords=keywords,
-                ),
-            )
-            out_parsed.write(json.dumps(asdict(doc), ensure_ascii=False) + "\n")
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--workers", type=int, default=16, help="dask worker processes")
+    args = ap.parse_args()
 
-            for chunk in doc.sections:
-                out_chunks.write(json.dumps(asdict(chunk), ensure_ascii=False) + "\n")
-                n_chunks += 1
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"wrote {len(df)} docs to {OUT_PARSED}")
-    print(f"wrote {n_chunks} section chunks to {OUT_CHUNKS}")
+    df = pd.read_csv(SRC_CSV).dropna(subset=["transcription"]).fillna("").reset_index(drop=True)
+    tasks = [(int(i), row.to_dict()) for i, row in df.iterrows()]
+    print(f"dispatching {len(tasks)} records across {args.workers} dask partitions -> {OUT_DIR}/")
+
+    bag = db.from_sequence(tasks, npartitions=args.workers)
+    results = bag.map_partitions(_process_partition).compute(
+        scheduler="processes", num_workers=args.workers
+    )
+
+    n_doctype = sum(1 for _, _, dt, _ in results if dt)
+    unmapped = sorted({s for _, s, _, u in results if u and s})
+    print(f"wrote {len(results)} per-doc JSON files  (doctype_cui set on {n_doctype})")
+    if unmapped:
+        print(f"warning: {len(unmapped)} specialties missing from "
+              f"{SPECIALTY_CUI_FILE.name}: {unmapped}")
 
 
 if __name__ == "__main__":

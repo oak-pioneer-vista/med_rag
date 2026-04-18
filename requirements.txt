@@ -3,3 +3,4 @@ qdrant-client
 sentence-transformers
 pandas
 neo4j
+dask
