@@ -21,7 +21,7 @@ pip install -r requirements.txt
 ### 1. Download the dataset
 
 ```bash
-python scripts/download_mtsamples.py
+python python/ingestion/download_mtsamples.py
 ```
 
 Downloads the [MTSamples](https://www.kaggle.com/datasets/tboyle10/medicaltranscriptions) dataset into `data/mtsamples/`.
@@ -38,13 +38,13 @@ docker compose up -d
 Data for both is persisted in Docker volumes. Verify the Neo4j connection with:
 
 ```bash
-python scripts/neo4j_smoke_test.py
+python python/neo4j_smoke_test.py
 ```
 
 ### 3. Ingest into Qdrant
 
 ```bash
-python scripts/ingest_mtsamples.py
+python python/ingestion/ingest_mtsamples.py
 ```
 
 Embeds medical transcriptions using `all-MiniLM-L6-v2` and upserts them into a `mtsamples` Qdrant collection with metadata (specialty, description, keywords).
@@ -55,7 +55,7 @@ Two-step pipeline: convert RRF files to admin-import CSVs, then bulk-load.
 
 ```bash
 # Convert (parallel; defaults to CPU count). ~70s on 32 cores for UMLS 2025AB.
-python scripts/umls_to_neo4j_csv.py \
+python python/ingestion/umls_to_neo4j_csv.py \
     --meta data/datasets/umls-2025AB-metathesaurus-full1/2025AB/META \
     --out  data/neo4j_import \
     --english-only --drop-suppressed --workers 32
@@ -64,7 +64,7 @@ python scripts/umls_to_neo4j_csv.py \
 bash scripts/load_neo4j.sh
 ```
 
-Result: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO row, carrying source code/TTY/string), and ~93.7M relationships (`HAS_ATOM`, `IS_A`, `RELATES`, `HAS_SEMTYPE`, `DEFINED_BY`) plus `SemanticType` and `Source` nodes. See the docstring in `scripts/umls_to_neo4j_csv.py` for the graph model.
+Result: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO row, carrying source code/TTY/string), and ~93.7M relationships (`HAS_ATOM`, `IS_A`, `RELATES`, `HAS_SEMTYPE`, `DEFINED_BY`) plus `SemanticType` and `Source` nodes. See the docstring in `python/ingestion/umls_to_neo4j_csv.py` for the graph model.
 
 `load_neo4j.sh` also creates indexes/constraints (`Concept.cui`, `Atom.aui`, `SemanticType.tui`, `Source.sab` uniqueness; `(Atom.sab, Atom.code)` range; `Concept.name` and `Atom.str` fulltext) and applies three semantic-type-derived labels to Concept nodes for query routing:
 

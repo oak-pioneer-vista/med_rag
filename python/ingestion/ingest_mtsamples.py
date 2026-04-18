@@ -5,7 +5,7 @@ sentence-transformers, and upserts into a Qdrant collection.
 
 Usage:
   docker compose up -d          # start Qdrant
-  python scripts/ingest_mtsamples.py
+  python python/ingestion/ingest_mtsamples.py
 """
 
 import pandas as pd
@@ -14,7 +14,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "kaggle" / "mtsamples"
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "kaggle" / "mtsamples"
 COLLECTION = "mtsamples"
 QDRANT_URL = "http://localhost:6333"
 EMBED_MODEL = "all-MiniLM-L6-v2"
@@ -25,7 +25,7 @@ def main():
     csv_path = DATA_DIR / "mtsamples.csv"
     if not csv_path.exists():
         raise FileNotFoundError(
-            f"{csv_path} not found. Run scripts/download_mtsamples.py first."
+            f"{csv_path} not found. Run python/ingestion/download_mtsamples.py first."
         )
 
     df = pd.read_csv(csv_path)

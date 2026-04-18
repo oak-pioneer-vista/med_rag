@@ -5,7 +5,7 @@ and runs a trivial write/read round-trip.
 
 Usage:
   docker compose up -d
-  python scripts/neo4j_smoke_test.py
+  python python/neo4j_smoke_test.py
 """
 
 import os

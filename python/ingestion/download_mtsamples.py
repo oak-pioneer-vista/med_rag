@@ -5,7 +5,7 @@ Requires:
   - Kaggle API credentials at ~/.kaggle/kaggle.json
 
 Usage:
-  python scripts/download_mtsamples.py
+  python python/ingestion/download_mtsamples.py
 """
 
 import subprocess
@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 DATASET = "tboyle10/medicaltranscriptions"
-DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "kaggle" / "mtsamples"
+DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "kaggle" / "mtsamples"
 
 
 def main():
