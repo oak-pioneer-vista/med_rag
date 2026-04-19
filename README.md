@@ -5,8 +5,23 @@ Medical RAG (Retrieval-Augmented Generation) pipeline built on the MTSamples med
 ## Prerequisites
 
 - Python 3.10+
-- Docker & Docker Compose
-- [Kaggle API credentials](https://www.kaggle.com/docs/api) at `~/.kaggle/kaggle.json`
+- Docker Engine 20.10+ with the Compose v2 plugin (`docker compose`, not the legacy `docker-compose`). On Ubuntu, install from Docker's official apt repo:
+  ```bash
+  sudo install -m 0755 -d /etc/apt/keyrings
+  sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  sudo chmod a+r /etc/apt/keyrings/docker.asc
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+      | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  sudo apt-get update
+  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+  sudo usermod -aG docker $USER   # log out/in (or `newgrp docker`) for group to take effect
+  ```
+- `gcloud` / `gsutil` authenticated with read access to `gs://med_rag/datasets/`
+- **(Recommended) NVIDIA GPU + CUDA** for the MedTE sentence encoder used in `python/ingestion/embed_sections.py`. The encoder auto-selects `cuda` when available and falls back to CPU otherwise, but CPU embedding the full MTSamples corpus is impractically slow. Verified on an NVIDIA L4 (24 GB) with driver 580.x. Install a matching CUDA build of PyTorch, e.g.:
+  ```bash
+  pip install torch --index-url https://download.pytorch.org/whl/cu121
+  python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
+  ```
 
 ## Setup
 
@@ -18,13 +33,17 @@ pip install -r requirements.txt
 
 ## Usage
 
-### 1. Download the dataset
+### 1. Download the datasets
 
 ```bash
+# MTSamples medical transcriptions -> data/kaggle/mtsamples.csv (~16 MB)
 python python/ingestion/download_mtsamples.py
+
+# UMLS 2025AB Metathesaurus Full -> data/umls/umls-2025AB-metathesaurus-full.zip (~5.3 GB)
+python python/ingestion/download_umls.py
 ```
 
-Downloads the [MTSamples](https://www.kaggle.com/datasets/tboyle10/medicaltranscriptions) dataset into `data/mtsamples/`.
+Both pull from `gs://med_rag/datasets/`.
 
 ### 2. Start Qdrant and Neo4j
 
@@ -51,16 +70,13 @@ Embeds medical transcriptions using `all-MiniLM-L6-v2` and upserts them into a `
 
 ### 4. Ingest UMLS into Neo4j
 
-Two-step pipeline: convert RRF files to admin-import CSVs, then bulk-load.
+Two-step pipeline: unzip + convert RRF files to admin-import CSVs, then bulk-load. Both steps are parallelized — the RRF-to-CSV pass uses one worker per CPU core (`multiprocessing` in `umls_to_neo4j_csv.py`), and `neo4j-admin database import` runs with `--threads=32 --high-parallel-io=on`.
 
 ```bash
-# Convert (parallel; defaults to CPU count). ~70s on 32 cores for UMLS 2025AB.
-python python/ingestion/umls_to_neo4j_csv.py \
-    --meta data/datasets/umls-2025AB-metathesaurus-full1/2025AB/META \
-    --out  data/neo4j_import \
-    --english-only --drop-suppressed --workers 32
+# Unzip data/umls/*.zip and convert to CSVs in data/neo4j_import/. ~90s on 32 cores.
+bash scripts/prepare_umls.sh
 
-# Bulk-load. Stops neo4j, runs neo4j-admin import, restarts. ~25s.
+# Bulk-load with 32 import threads + parallel I/O. Stops neo4j, runs neo4j-admin import, restarts. ~25s.
 bash scripts/load_neo4j.sh
 ```
 
