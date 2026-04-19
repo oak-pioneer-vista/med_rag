@@ -127,4 +127,15 @@ Windows each `Section` into sentence packs of ≤350 tokens with 15% overlap, em
 python python/ingestion/embed_sections.py [--workers 16] [--recreate]
 ```
 
-Point ids are `uuid5(chunk_id)` so re-runs are idempotent. Each Qdrant point's payload carries `chunk_id`, `parent_chunk_id`, `window_index`/`window_count`, `doc_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `doctype_cui`, `sample_name`, `keywords`, and the windowed `text`. Collection dim and distance (cosine) are inferred from TEI's `/embed` response on startup.
+Point ids are `uuid5(chunk_id)` so re-runs are idempotent. Each Qdrant point's payload carries `chunk_id`, `parent_chunk_id`, `window_index`/`window_count`, `doc_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `doctype_cui`, `sample_name`, `keywords`, and the windowed `text`. Collection dim and distance (cosine) are inferred from TEI's `/embed` response on startup. End state after a full run: 4,966 docs → **43,244** section-window points (768-d cosine).
+
+#### Retrieval sanity check
+
+Query `"Left testicular swelling for one day.  Testicular Ultrasound"` (an exact substring of doc 42's `REASON FOR EXAM`) against the collection, top-50:
+
+- **27 unique docs** among the 50 section hits.
+- Top 2 @ score **0.969**: docs 42 (Urology) and 1496 (Radiology) — MTSamples cross-files the same `Testicular Ultrasound` note under two specialties, so both come back tied.
+- Next cluster @ **~0.86**: `Lymphoblastic Leukemia - Consult` appearing under four specialties (Hematology-Oncology, Consult-H&P, Cardiovascular/Pulmonary, General Medicine) — same cross-filing pattern.
+- Remaining hits are semantically on-topic: `Testicular Pain`, `Orchiectomy`/`Orchiopexy`, `Scrotal Exploration`, `Hydrocelectomy`, etc.
+
+Takeaway: MedTE + mean pooling ranks the exact match at the top and retrieves a clinically coherent neighborhood, but the MTSamples dataset contains duplicate notes across specialties. Downstream retrieval should dedupe on a content hash (or on `sample_name` + `description`) before presenting results to the user, or the top-k will be padded with the same underlying note.
