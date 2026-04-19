@@ -131,11 +131,10 @@ Point ids are `uuid5(chunk_id)` so re-runs are idempotent. Each Qdrant point's p
 
 #### Retrieval sanity check
 
-Query `"Left testicular swelling for one day.  Testicular Ultrasound"` (an exact substring of doc 42's `REASON FOR EXAM`) against the collection, top-50:
+Short concept query `"lymphoblastic Leukemia"` against the collection, top-50:
 
-- **27 unique docs** among the 50 section hits.
-- Top 2 @ score **0.969**: docs 42 (Urology) and 1496 (Radiology) — MTSamples cross-files the same `Testicular Ultrasound` note under two specialties, so both come back tied.
-- Next cluster @ **~0.86**: `Lymphoblastic Leukemia - Consult` appearing under four specialties (Hematology-Oncology, Consult-H&P, Cardiovascular/Pulmonary, General Medicine) — same cross-filing pattern.
-- Remaining hits are semantically on-topic: `Testicular Pain`, `Orchiectomy`/`Orchiopexy`, `Scrotal Exploration`, `Hydrocelectomy`, etc.
+- **26 unique docs** among the 50 section hits.
+- Top 4 @ score **0.656**: `Lymphoblastic Leukemia - Consult` appearing under four specialties (Hematology-Oncology, General Medicine, Cardiovascular/Pulmonary, Consult-H&P) — MTSamples cross-files the same note under multiple specialty tags, so all four surface together on `HISTORY OF PRESENT ILLNESS`. The same four docs also cluster on `CHIEF COMPLAINT` (0.65), `ASSESSMENT` (0.648), and `LABORATORY DATA` (0.472), consuming a large share of the top-50 slots.
+- Remaining hits are clinically adjacent: `Antibiotic Therapy Consult` (0.644), `Aplastic Anemia Followup` (0.603), `Non-Hodgkin lymphoma Followup` (0.58), `MediPort Placement` / `Removal of Venous Port` (central-line care for chemotherapy), `Thrombocytopenia - Consult`, `Ommaya reservoir`, `Leiomyosarcoma`, etc. Two off-topic bleed-ins at ~0.48: `Prostatitis - Recheck` and a urology `REVIEW OF SYSTEMS`.
 
-Takeaway: MedTE + mean pooling ranks the exact match at the top and retrieves a clinically coherent neighborhood, but the MTSamples dataset contains duplicate notes across specialties. Downstream retrieval should dedupe on a content hash (or on `sample_name` + `description`) before presenting results to the user, or the top-k will be padded with the same underlying note.
+Takeaways: (1) MedTE + mean pooling retrieves a clinically coherent oncology neighborhood (leukemia → related heme/onc consults → chemo access devices) rather than keyword-matching only. (2) The two-word query produces much lower absolute scores (~0.66 peak) than a sentence-length query would — MedTE is tuned for sentence embeddings, so bare concept strings aren't ideal inputs. (3) MTSamples contains duplicate notes cross-filed under multiple specialty tags, so downstream retrieval should dedupe on a content hash (or on `sample_name` + `description`) before presenting results to the user, or the top-k will be padded with the same underlying note.
