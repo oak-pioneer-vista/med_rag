@@ -22,7 +22,31 @@ services:
       - NEO4J_AUTH=neo4j/medragpass
       - NEO4J_PLUGINS=["apoc"]
 
+  # HuggingFace Text Embeddings Inference serving MedTE on the host GPU.
+  # Image tag `89-latest` targets CUDA compute capability 8.9 (NVIDIA L4/Ada).
+  medte:
+    image: ghcr.io/huggingface/text-embeddings-inference:89-latest
+    ports:
+      - "8080:80"
+    volumes:
+      - medte_cache:/data
+    environment:
+      - HF_HOME=/data
+    command:
+      - --model-id=MohammadKhodadad/MedTE-cl15-step-8000
+      - --pooling=mean
+      - --max-batch-tokens=16384
+      - --max-client-batch-size=64
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
 volumes:
   qdrant_data:
   neo4j_data:
   neo4j_logs:
+  medte_cache:

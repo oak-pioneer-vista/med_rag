@@ -17,11 +17,7 @@ Medical RAG (Retrieval-Augmented Generation) pipeline built on the MTSamples med
   sudo usermod -aG docker $USER   # log out/in (or `newgrp docker`) for group to take effect
   ```
 - `gcloud` / `gsutil` authenticated with read access to `gs://med_rag/datasets/`
-- **(Recommended) NVIDIA GPU + CUDA** for the MedTE sentence encoder used in `python/ingestion/embed_sections.py`. The encoder auto-selects `cuda` when available and falls back to CPU otherwise, but CPU embedding the full MTSamples corpus is impractically slow. Verified on an NVIDIA L4 (24 GB) with driver 580.x. Install a matching CUDA build of PyTorch, e.g.:
-  ```bash
-  pip install torch --index-url https://download.pytorch.org/whl/cu121
-  python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
-  ```
+- **(Recommended) NVIDIA GPU + CUDA** for the MedTE TEI container (see `docker-compose.yml`). Embedding runs server-side inside TEI — the Python pipeline only POSTs text — so no host-side PyTorch install is required. Verified on an NVIDIA L4 (24 GB) with driver 580.x.
 
 ## Setup
 
@@ -45,7 +41,7 @@ python python/ingestion/download_umls.py
 
 Both pull from `gs://med_rag/datasets/`.
 
-### 2. Start Qdrant and Neo4j
+### 2. Start Qdrant, Neo4j, and the MedTE embedding service
 
 ```bash
 docker compose up -d
@@ -53,6 +49,9 @@ docker compose up -d
 
 - Qdrant on `localhost:6333` (REST) and `localhost:6334` (gRPC).
 - Neo4j on `localhost:7474` (Browser) and `localhost:7687` (Bolt). Default credentials: `neo4j` / `medragpass` (override via `NEO4J_USER` / `NEO4J_PASSWORD`).
+- MedTE (HuggingFace [text-embeddings-inference](https://github.com/huggingface/text-embeddings-inference) serving `MohammadKhodadad/MedTE-cl15-step-8000`) on `localhost:8080`, configured with `--pooling=mean` since MedTE (a GTE-family BertModel) was contrastively pretrained on mean-pooled + L2-normalized vectors — TEI's default CLS pooling would ignore that training geometry. Embed text with `POST /embed`: `curl -s localhost:8080/embed -H 'content-type: application/json' -d '{"inputs":"acute myocardial infarction"}'`. The image tag `89-latest` targets NVIDIA compute capability 8.9 (L4/Ada); swap it if your GPU has a different CC.
+
+The MedTE container requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html). If `docker run --gpus all` errors out, run `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker` to register the nvidia runtime.
 
 Data for both is persisted in Docker volumes. Verify the Neo4j connection with:
 
@@ -104,3 +103,28 @@ Imported into Neo4j: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO ro
 - `:Peripheral` — everything else (~2.14M nodes)
 
 A pre-built snapshot of the imported store is at `gs://med_rag/neo4j_processed/neo4j_data.tar.zst` (~900 MB) — restore by extracting into the `med_rag_neo4j_data` Docker volume with neo4j stopped.
+
+### 5. Parse MTSamples into per-doc JSON
+
+Splits each transcription on ALL-CAPS `HEADING:` tokens and emits one `MTSampleDoc` JSON per row (one file per source row) into `data/mtsamples_docs/`. These intermediates are what the embedding step in `python/ingestion/embed_sections.py` consumes.
+
+```bash
+# Build the heading allowlist from the raw CSV (1,803 headings, filtered by MIN_DOCS/MAX_WORDS).
+python python/ingestion/extract_mt_headings.py
+
+# Fan out per-row parse across dask workers (default 16). ~few seconds on 32 cores.
+python python/ingestion/parse_mtsamples.py [--workers 16]
+```
+
+Result: 4,966 per-doc JSONs under `data/mtsamples_docs/{doc_id:04d}.json`. Each doc carries `doc_id`, `specialty`, `specialty_cui`, `doctype_cui` (explicit mapping or heuristic rule), `sample_name`, `keywords`, and a list of `Section` records (`chunk_id`, `section_type`, `text`, plus placeholders for `embedding` and `entities` populated downstream). `doctype_cui` is set on 3,583/4,966 docs (specialties without an explicit mapping in `data/doctype_cui.json` and no matching heading rule get `""`).
+
+### 6. Embed section text into Qdrant
+
+Windows each `Section` into sentence packs of ≤350 tokens with 15% overlap, embeds every window by POSTing batches of up to 64 texts to the MedTE TEI service on `localhost:8080`, and upserts the vectors into the `mtsamples_sections` Qdrant collection. Parallelism is via `dask.bag.map_partitions` — each of the default 16 worker processes owns its own HTTP session and local tokenizer (used only for counting tokens during packing; the GPU-resident TEI container does all the encoding).
+
+```bash
+# Requires qdrant + medte services from `docker compose up -d`.
+python python/ingestion/embed_sections.py [--workers 16] [--recreate]
+```
+
+Point ids are `uuid5(chunk_id)` so re-runs are idempotent. Each Qdrant point's payload carries `chunk_id`, `parent_chunk_id`, `window_index`/`window_count`, `doc_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `doctype_cui`, `sample_name`, `keywords`, and the windowed `text`. Collection dim and distance (cosine) are inferred from TEI's `/embed` response on startup.

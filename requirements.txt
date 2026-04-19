@@ -4,3 +4,5 @@ sentence-transformers
 pandas
 neo4j
 dask
+requests
+transformers

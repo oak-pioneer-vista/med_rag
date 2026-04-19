@@ -1,17 +1,16 @@
-"""Embed MTSamples Section text with MedTE and upsert to Qdrant (dask parallel).
+"""Embed MTSamples Section text via TEI and upsert to Qdrant (dask parallel).
 
-Reads the per-doc JSON files written by parse_mtsamples.py, embeds each
-Section's text with the MedTE sentence encoder, and upserts the vectors
-to a Qdrant collection. Parallelism is via `dask.bag.map_partitions`:
-each partition loads the HF model once and processes its share of docs.
-
-MedTE (MohammadKhodadad/MedTE-cl15-step-8000) is a BertModel of the GTE
-contrastive family — no sentence-transformers wrapper on the Hub, so we
-build the encoder manually with mean pooling + L2 normalization.
+Reads the per-doc JSON files written by parse_mtsamples.py, packs each
+Section into overlapping sentence windows, embeds them by calling the
+HuggingFace text-embeddings-inference (TEI) service on :8080, and
+upserts the vectors to a Qdrant collection. Parallelism is via
+`dask.bag.map_partitions`: each worker owns an HTTP session and a local
+tokenizer (used only for token counting during packing -- TEI handles
+the actual encoding).
 
 Usage:
-  docker compose up -d qdrant
-  python python/ingestion/embed_sections.py [--workers 16] [--batch 32]
+  docker compose up -d qdrant medte
+  python python/ingestion/embed_sections.py [--workers 16] [--batch 64]
 """
 
 from __future__ import annotations
@@ -25,10 +24,10 @@ from typing import Iterable
 
 import dask.bag as db
 import numpy as np
-import torch
+import requests
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
-from transformers import AutoConfig, AutoModel, AutoTokenizer
+from transformers import AutoTokenizer
 
 REPO = Path(__file__).resolve().parent.parent.parent
 DOCS_DIR = REPO / "data" / "mtsamples_docs"
@@ -36,6 +35,7 @@ DOCS_DIR = REPO / "data" / "mtsamples_docs"
 MODEL_ID = "MohammadKhodadad/MedTE-cl15-step-8000"
 COLLECTION = "mtsamples_sections"
 QDRANT_URL = "http://localhost:6333"
+TEI_URL = "http://localhost:8080"
 # Deterministic uuid5 namespace so re-runs upsert into the same point id.
 POINT_NS = uuid.UUID("6f3c0c2a-6c2c-4c9a-b9ea-0ea0d3f8f5a1")
 
@@ -47,40 +47,10 @@ MAX_TOKENS = 350
 OVERLAP_FRAC = 0.15
 OVERLAP_TOKENS = int(MAX_TOKENS * OVERLAP_FRAC)
 
-
-def _mean_pool(hidden: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
-    """Attention-masked mean pool. Standard for GTE-family encoders."""
-    mask = attn_mask.unsqueeze(-1).float()
-    return (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-
-
-class MedTEEncoder:
-    def __init__(self, device: str | None = None, max_length: int = 512) -> None:
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.max_length = max_length
-        self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-        self.model = AutoModel.from_pretrained(MODEL_ID).to(self.device).eval()
-        self.dim = self.model.config.hidden_size
-
-    @torch.no_grad()
-    def encode(self, texts: list[str], batch_size: int = 32) -> np.ndarray:
-        if not texts:
-            return np.zeros((0, self.dim), dtype=np.float32)
-        out = np.empty((len(texts), self.dim), dtype=np.float32)
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            enc = self.tokenizer(
-                batch,
-                truncation=True,
-                padding=True,
-                max_length=self.max_length,
-                return_tensors="pt",
-            ).to(self.device)
-            hidden = self.model(**enc).last_hidden_state
-            pooled = _mean_pool(hidden, enc["attention_mask"])
-            pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
-            out[i : i + len(batch)] = pooled.cpu().numpy().astype(np.float32)
-        return out
+# TEI's --max-client-batch-size in docker-compose.yml is 64; match it so a
+# single POST fills one server-side batch.
+TEI_BATCH = 64
+QDRANT_BATCH = 256
 
 
 # Lightweight sentence splitter: break on .!? followed by whitespace and an
@@ -108,7 +78,7 @@ def _pack_sentences(
     window until the next one would push past `max_tokens`. The next window
     starts a few sentences earlier so ~`overlap` tokens are shared. A single
     sentence longer than `max_tokens` forms its own window and gets truncated
-    at encode time.
+    by TEI (auto_truncate=true).
     """
     sentences = _split_sentences(text)
     if not sentences:
@@ -125,7 +95,7 @@ def _pack_sentences(
             cur += counts[end]
             end += 1
         if end == start:
-            end = start + 1  # oversized lone sentence; tokenizer will truncate
+            end = start + 1  # oversized lone sentence; TEI will truncate
         windows.append(" ".join(sentences[start:end]))
         if end >= n:
             break
@@ -136,6 +106,19 @@ def _pack_sentences(
             back += counts[new_start]
         start = new_start
     return windows
+
+
+def _tei_embed(session: requests.Session, texts: list[str], dim: int) -> np.ndarray:
+    """POST texts to TEI /embed in chunks of TEI_BATCH; return (N, dim) float32."""
+    if not texts:
+        return np.zeros((0, dim), dtype=np.float32)
+    out = np.empty((len(texts), dim), dtype=np.float32)
+    for i in range(0, len(texts), TEI_BATCH):
+        batch = texts[i : i + TEI_BATCH]
+        r = session.post(f"{TEI_URL}/embed", json={"inputs": batch}, timeout=300)
+        r.raise_for_status()
+        out[i : i + len(batch)] = np.asarray(r.json(), dtype=np.float32)
+    return out
 
 
 def _read_doc(path: str) -> dict:
@@ -179,27 +162,40 @@ def _chunk_doc(doc: dict, tokenizer) -> tuple[list[str], list[str], list[dict]]:
     return texts, ids, payloads
 
 
+def _tei_info() -> dict:
+    r = requests.get(f"{TEI_URL}/info", timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def _probe_dim(session: requests.Session) -> int:
+    r = session.post(f"{TEI_URL}/embed", json={"inputs": ["probe"]}, timeout=60)
+    r.raise_for_status()
+    return len(r.json()[0])
+
+
 def _process_partition(paths: Iterable[str]) -> list[tuple[int, int]]:
-    """Dask worker: load model once, embed + upsert every section in this partition.
+    """Dask worker: tokenize + pack + embed via TEI + upsert every section.
 
     Returns a single-element list [(n_docs, n_sections)] so the driver can
     aggregate across partitions.
     """
-    import os, sys, time
+    import os, time
     wid = os.getpid()
     t0 = time.time()
     paths = list(paths)
     print(f"[worker {wid}] starting on {len(paths)} docs", flush=True)
 
-    encoder = MedTEEncoder()
-    t_model = time.time() - t0
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    session = requests.Session()
+    dim = _probe_dim(session)
     client = QdrantClient(url=QDRANT_URL, timeout=60)
 
     all_texts: list[str] = []
     all_ids: list[str] = []
     all_payloads: list[dict] = []
     for path in paths:
-        texts, ids, payloads = _chunk_doc(_read_doc(path), encoder.tokenizer)
+        texts, ids, payloads = _chunk_doc(_read_doc(path), tokenizer)
         all_texts.extend(texts)
         all_ids.extend(ids)
         all_payloads.extend(payloads)
@@ -208,23 +204,19 @@ def _process_partition(paths: Iterable[str]) -> list[tuple[int, int]]:
         print(f"[worker {wid}] no sections, done in {time.time()-t0:.1f}s", flush=True)
         return [(len(paths), 0)]
 
-    print(
-        f"[worker {wid}] model loaded in {t_model:.1f}s, embedding {len(all_texts)} sections",
-        flush=True,
-    )
     t_embed = time.time()
-    embs = encoder.encode(all_texts)
+    embs = _tei_embed(session, all_texts, dim)
     t_embed = time.time() - t_embed
 
     points = [
         PointStruct(id=pid, vector=emb.tolist(), payload=pl)
         for pid, emb, pl in zip(all_ids, embs, all_payloads)
     ]
-    for i in range(0, len(points), 256):
-        client.upsert(collection_name=COLLECTION, points=points[i : i + 256])
+    for i in range(0, len(points), QDRANT_BATCH):
+        client.upsert(collection_name=COLLECTION, points=points[i : i + QDRANT_BATCH])
 
     print(
-        f"[worker {wid}] embedded {len(points)} in {t_embed:.1f}s "
+        f"[worker {wid}] embedded {len(points)} via TEI in {t_embed:.1f}s "
         f"(total {time.time()-t0:.1f}s)",
         flush=True,
     )
@@ -240,8 +232,11 @@ def main() -> None:
     )
     args = ap.parse_args()
 
-    dim = AutoConfig.from_pretrained(MODEL_ID).hidden_size
-    print(f"model={MODEL_ID}  dim={dim}")
+    info = _tei_info()
+    print(f"tei model={info.get('model_id')}  pooling={info.get('model_type', {}).get('embedding', {}).get('pooling')}")
+    with requests.Session() as s:
+        dim = _probe_dim(s)
+    print(f"embedding dim={dim}")
 
     client = QdrantClient(url=QDRANT_URL, timeout=60)
     if args.recreate and client.collection_exists(COLLECTION):
@@ -265,9 +260,9 @@ def main() -> None:
 
     n_docs = sum(r[0] for r in results)
     n_points = sum(r[1] for r in results)
-    info = client.get_collection(COLLECTION)
+    coll_info = client.get_collection(COLLECTION)
     print(f"processed {n_docs} docs, upserted {n_points} section embeddings")
-    print(f"collection '{COLLECTION}' points_count={info.points_count}")
+    print(f"collection '{COLLECTION}' points_count={coll_info.points_count}")
 
 
 if __name__ == "__main__":
