@@ -80,7 +80,21 @@ bash scripts/prepare_umls.sh
 bash scripts/load_neo4j.sh
 ```
 
-Result: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO row, carrying source code/TTY/string), and ~93.7M relationships (`HAS_ATOM`, `IS_A`, `RELATES`, `HAS_SEMTYPE`, `DEFINED_BY`) plus `SemanticType` and `Source` nodes. See the docstring in `python/ingestion/umls_to_neo4j_csv.py` for the graph model.
+Row counts for UMLS 2025AB after `--english-only --drop-suppressed` (raw RRF → admin-import CSV; self-loops and refs to dropped concepts also removed):
+
+| RRF | Raw lines | Output CSV | Rows |
+|---|---:|---|---:|
+| MRCONSO.RRF | 17,390,109 | `concepts.csv` (unique CUIs) | 3,303,277 |
+| MRCONSO.RRF | (same) | `atoms.csv` | 9,026,723 |
+| MRCONSO.RRF | (same) | `concept_atom.csv` | 9,026,723 |
+| MRSTY.RRF | 3,834,110 | `semantic_types.csv` | 127 |
+| MRSTY.RRF | (same) | `concept_semtype.csv` | 3,645,587 |
+| MRREL.RRF | 63,494,934 | `concept_relates.csv` | 40,124,828 |
+| MRHIER.RRF | 40,573,034 | `concept_parent.csv` | 40,418,715 |
+| MRDEF.RRF | 479,151 | `concept_definition.csv` | 464,510 |
+| MRSAB.RRF | 197 | `sources.csv` | 192 |
+
+Imported into Neo4j: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO row, carrying source code/TTY/string), and ~93.7M relationships (`HAS_ATOM`, `IS_A`, `RELATES`, `HAS_SEMTYPE`, `DEFINED_BY`) plus `SemanticType` and `Source` nodes. See the docstring in `python/ingestion/umls_to_neo4j_csv.py` for the graph model.
 
 `load_neo4j.sh` also creates indexes/constraints (`Concept.cui`, `Atom.aui`, `SemanticType.tui`, `Source.sab` uniqueness; `(Atom.sab, Atom.code)` range; `Concept.name` and `Atom.str` fulltext) and applies four semantic-type-derived labels to Concept nodes for query routing:
 
