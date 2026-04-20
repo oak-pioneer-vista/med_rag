@@ -12,3 +12,4 @@ Medical RAG (Retrieval-Augmented Generation) pipeline built on the MTSamples med
 
 - [**Ingestion pipeline**](docs/ingestion.md) — prerequisites, setup, and the step-by-step commands to build the Qdrant section-embedding collection and the Neo4j UMLS graph.
 - [**Learning notes**](docs/learning_notes.md) — non-obvious things learned while building this: short-query degradation on sentence-level encoders, TEI vs. in-process transformers trade-offs, pooling gotchas.
+- [**Neo4j queries**](docs/query.md) — sample Cypher queries against the UMLS graph (e.g. `may_treat` lookups via the `concept_name_fts` fulltext index).
