@@ -154,6 +154,7 @@ def _chunk_doc(doc: dict, tokenizer) -> tuple[list[str], list[str], list[dict]]:
                 "section_cui": s["section_cui"],
                 "specialty": s["specialty"],
                 "specialty_cui": s["specialty_cui"],
+                "alt_specialties": doc.get("alt_specialties", []),
                 "doctype_cui": doc["doctype_cui"],
                 "sample_name": doc["sample_name"],
                 "keywords": s["keywords"],

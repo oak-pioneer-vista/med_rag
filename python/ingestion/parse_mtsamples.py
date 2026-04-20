@@ -63,6 +63,11 @@ class MTSampleDoc:
     doctype_cui: str
     sample_name: str
     keywords: str
+    # Cross-filing: MTSamples ships many notes under multiple medical_specialty
+    # tags with byte-identical `transcription`. We dedupe on transcription
+    # content and record the dropped rows' specialty/CUI here so downstream
+    # specialty filters still match cross-filed notes.
+    alt_specialties: list[dict] = field(default_factory=list)
     sections: list[Section] = field(default_factory=list)
 
 
@@ -187,6 +192,7 @@ def _process_one(
     specialty = str(row.get("medical_specialty") or "").strip()
     keywords = str(row.get("keywords") or "").strip()
     spec_cui = specialty_cui_map.get(specialty, "")
+    alt_specialty_names = row.get("alt_specialties") or []
     sections = parse_sections(
         row["transcription"],
         allowed,
@@ -195,12 +201,24 @@ def _process_one(
         specialty_cui=spec_cui,
         keywords=keywords,
     )
+    section_types = {s.section_type for s in sections}
     doctype_cui = infer_doctype_cui(
-        specialty,
-        {s.section_type for s in sections},
-        doctype_explicit,
-        doctype_rules,
+        specialty, section_types, doctype_explicit, doctype_rules
     )
+    # Carry full CUI coverage for every cross-filing: categories with an
+    # empty specialty_cui (doc-type buckets like "Discharge Summary",
+    # "Consult - History and Phy.") would otherwise have no CUI attached
+    # to the alt record at all.
+    alt_specialties = [
+        {
+            "specialty": alt,
+            "specialty_cui": specialty_cui_map.get(alt, ""),
+            "doctype_cui": infer_doctype_cui(
+                alt, section_types, doctype_explicit, doctype_rules
+            ),
+        }
+        for alt in alt_specialty_names
+    ]
     doc = MTSampleDoc(
         doc_id=doc_id,
         description=str(row.get("description") or "").strip(),
@@ -209,6 +227,7 @@ def _process_one(
         doctype_cui=doctype_cui,
         sample_name=str(row.get("sample_name") or "").strip(),
         keywords=keywords,
+        alt_specialties=alt_specialties,
         sections=sections,
     )
     path = OUT_DIR / f"{doc_id:04d}.json"
@@ -227,14 +246,94 @@ def _process_partition(partition: Iterable[tuple[int, dict]]) -> list[tuple]:
     ]
 
 
+def _merge_keyword_tokens(a: str, b: str) -> str:
+    """Union comma-split tokens from two keyword strings, case-insensitive dedupe.
+
+    MTSamples keyword strings in a dupe cluster typically differ only by a
+    leading specialty token (e.g. "surgery, ..." vs "gastroenterology, ...")
+    on otherwise identical content -- union keeps the cross-filing tokens
+    without duplicating the clinical vocabulary.
+    """
+    seen: dict[str, str] = {}
+    for part in a.split(",") + b.split(","):
+        tok = part.strip()
+        if not tok:
+            continue
+        key = tok.lower()
+        if key not in seen:
+            seen[key] = tok
+    return ", ".join(seen.values())
+
+
+def dedupe_by_transcription(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse byte-identical transcriptions across medical_specialty filings.
+
+    MTSamples ships the same note under multiple `medical_specialty` rows
+    (e.g. "Lumbar Discogram" filed under 5 specialties) with byte-identical
+    `transcription`. Embedding all copies wastes Qdrant points and pads top-k
+    with trivial dupes. Keep the first row's primary metadata, record dropped
+    rows' specialty names in `alt_specialties` (enriched to full CUI records
+    per-doc in `_process_one`), and union keyword tokens so downstream
+    specialty/keyword filters still match cross-filings.
+    """
+    first_idx: dict[str, int] = {}
+    alts_by_first: dict[int, list[str]] = {}
+    kw_by_first: dict[int, str] = {}
+    drop_idx: list[int] = []
+
+    for i, row in df.iterrows():
+        t = row["transcription"]
+        if t in first_idx:
+            fi = first_idx[t]
+            spec = str(row.get("medical_specialty") or "").strip()
+            alts_by_first.setdefault(fi, []).append(spec)
+            base_kw = kw_by_first.get(fi, str(df.at[fi, "keywords"] or "").strip())
+            kw_by_first[fi] = _merge_keyword_tokens(
+                base_kw, str(row.get("keywords") or "").strip()
+            )
+            drop_idx.append(int(i))
+        else:
+            first_idx[t] = int(i)
+
+    out = df.drop(index=drop_idx).reset_index(drop=True)
+
+    # Map (new row index in `out`) -> original-first index in `df`.
+    # `first_idx.values()` is ordered by first-occurrence, same order `drop`
+    # preserves, so enumerating `out` lines up 1:1 with sorted kept indices.
+    kept_sorted = sorted(first_idx.values())
+    for new_i, old_i in enumerate(kept_sorted):
+        if old_i in kw_by_first:
+            out.at[new_i, "keywords"] = kw_by_first[old_i]
+
+    alt_col: list[list[str]] = [alts_by_first.get(old_i, []) for old_i in kept_sorted]
+    out["alt_specialties"] = alt_col
+
+    n_clusters = len(alts_by_first)
+    n_dropped = len(drop_idx)
+    print(
+        f"dedupe: {len(df)} -> {len(out)} rows "
+        f"({n_clusters} clusters collapsed, {n_dropped} dupe rows dropped)"
+    )
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--workers", type=int, default=16, help="dask worker processes")
     args = ap.parse_args()
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    # doc_ids are assigned fresh each run from the post-dedupe row index, so
+    # stale files from prior runs would leave a mix of old and new indices.
+    stale = list(OUT_DIR.glob("*.json"))
+    if stale:
+        for p in stale:
+            p.unlink()
+        print(f"cleared {len(stale)} stale JSON files from {OUT_DIR}/")
 
     df = pd.read_csv(SRC_CSV).dropna(subset=["transcription"]).fillna("").reset_index(drop=True)
+    df = dedupe_by_transcription(df)
+
     tasks = [(int(i), row.to_dict()) for i, row in df.iterrows()]
     print(f"dispatching {len(tasks)} records across {args.workers} dask partitions -> {OUT_DIR}/")
 
