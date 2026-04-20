@@ -101,7 +101,7 @@ Row counts for UMLS 2025AB after `--english-only --drop-suppressed` (raw RRF →
 
 Imported into Neo4j: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO row, carrying source code/TTY/string), and ~93.7M relationships (`HAS_ATOM`, `IS_A`, `RELATES`, `HAS_SEMTYPE`, `DEFINED_BY`) plus `SemanticType` and `Source` nodes. See the docstring in `python/ingestion/umls_to_neo4j_csv.py` for the graph model.
 
-`load_neo4j.sh` also creates indexes/constraints (`Concept.cui`, `Atom.aui`, `SemanticType.tui`, `Source.sab` uniqueness; `(Atom.sab, Atom.code)` range; `Concept.name` and `Atom.str` fulltext) and applies four semantic-type-derived labels to Concept nodes for query routing:
+`load_neo4j.sh` invokes `scripts/create_neo4j_indices.sh` at the end — that's where the constraints/indexes/full-text indexes live and where the four semantic-type-derived labels below get applied to Concept nodes for query routing:
 
 - `:ClinicalCore` — Disease/Drug/Procedure/Anatomy (~735K nodes)
 - `:ClinicalSupport` — Device/Lab/Finding/Food (~418K nodes)
@@ -126,14 +126,14 @@ Result: **2,357 per-doc JSONs** under `data/mtsamples_docs/{doc_id:04d}.json`. T
 
 ### 6. Embed section text into Qdrant
 
-Windows each `Section` into sentence packs of ≤350 tokens with 15% overlap, embeds every window by POSTing batches of up to 64 texts to the MedTE TEI service on `localhost:8080`, and upserts the vectors into the `mtsamples_sections` Qdrant collection. Parallelism is via `dask.bag.map_partitions` — each of the default 16 worker processes owns its own HTTP session and local tokenizer (used only for counting tokens during packing; the GPU-resident TEI container does all the encoding).
+Windows each `Section` into sentence packs of ≤200 tokens with 10% overlap, embeds every window by POSTing batches of up to 64 texts to the MedTE TEI service on `localhost:8080`, and upserts the vectors into the `mtsamples_sections` Qdrant collection. Parallelism is via `dask.bag.map_partitions` — each of the default 16 worker processes owns its own HTTP session and local tokenizer (used only for counting tokens during packing; the GPU-resident TEI container does all the encoding).
 
 ```bash
 # Requires qdrant + medte services from `docker compose up -d`.
 python python/ingestion/embed_sections.py [--workers 16] [--recreate]
 ```
 
-Point ids are `uuid5(chunk_id)` so re-runs are idempotent. Each Qdrant point's payload carries `chunk_id`, `parent_chunk_id`, `window_index`/`window_count`, `doc_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `alt_specialties`, `doctype_cui`, `sample_name`, `keywords`, and the windowed `text`. Collection dim and distance (cosine) are inferred from TEI's `/embed` response on startup. End state after a full run: 2,357 docs → **20,019** section-window points (768-d cosine).
+Point ids are `uuid5(chunk_id)` so re-runs are idempotent. Each Qdrant point's payload carries `chunk_id`, `parent_chunk_id`, `window_index`/`window_count`, `doc_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `alt_specialties`, `doctype_cui`, `sample_name`, `keywords`, and the windowed `text`. Collection dim and distance (cosine) are inferred from TEI's `/embed` response on startup. The collection is created with `optimizers.indexing_threshold=100` — Qdrant's default (~20k per segment) would otherwise leave every segment unindexed at this scale, falling back to brute-force search on every query. End state after a full run: 2,357 docs → **22,824** section-window points (768-d cosine).
 
 #### Retrieval sanity check
 
@@ -145,3 +145,24 @@ Instruction-style query `"Retrieve all patients diagnosed with Lymphoblastic Leu
 - Remaining hits are clinically adjacent: `Removal of Venous Port` (0.599), `Aplastic Anemia Followup`, `Non-Hodgkin lymphoma Followup`, `Polycythemia Vera Followup`, `Leiomyosarcoma`, `MediPort Placement` / `Ommaya reservoir` (chemo access), `Astrocytoma`, `T-Cell Lymphoma Consult`, `Posttransplant Lymphoproliferative Disorder`, and a couple of general discharge summaries.
 
 Takeaways: (1) MedTE + mean pooling retrieves a clinically coherent oncology neighborhood (leukemia → related heme/onc consults → chemo access devices). (2) Instruction-style query phrasing and the family-history-vs-index-case distinction both trip the encoder — the top hit being a family-history surface match is expected bi-encoder behavior; a reranker (cross-encoder) or an instruction-tuned embedder (`intfloat/e5-*`, BGE) would be needed to fix it. (3) Post-dedupe the top-k now surfaces genuinely distinct clinical neighbors instead of near-identical cross-filings — compare to the pre-dedupe run where the target doc occupied ~half of the top-50 as four cross-filed copies.
+
+### 7. Create Qdrant payload indexes
+
+```bash
+python scripts/create_qdrant_indices.py
+```
+
+Idempotent. Ensures `indexing_threshold=100` (matches what `embed_sections.py` sets on create, so re-asserts the value against any pre-existing collection), and creates payload indexes on the fields we filter by:
+
+- keyword: `parent_chunk_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `doctype_cui`, `sample_name`
+- integer: `doc_id`, `window_index`, `window_count`
+
+Without these, filters like `doc_id == 2306` or `specialty == "Nephrology"` are O(n) scans over 22K payloads on every query. Re-run whenever a new filterable field is introduced; existing indexes are a no-op.
+
+### 8. Create Neo4j constraints, indexes, and tier labels
+
+```bash
+bash scripts/create_neo4j_indices.sh
+```
+
+`scripts/load_neo4j.sh` calls this automatically at the end of the bulk-import step, so you don't need to run it again after a fresh load. Run it standalone when you want to re-assert the schema without re-importing — e.g. after restoring from the `neo4j_data.tar.zst` snapshot. Creates uniqueness constraints (`Concept.cui`, `Atom.aui`, `SemanticType.tui`, `Source.sab`), a range index on `(Atom.sab, Atom.code)` and `Concept.name`, full-text indexes `concept_name_fts` and `atom_str_fts`, and applies the four `:ClinicalCore` / `:ClinicalSupport` / `:ClinicalDiscipline` / `:Peripheral` tier labels.

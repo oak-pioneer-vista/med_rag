@@ -26,7 +26,12 @@ import dask.bag as db
 import numpy as np
 import requests
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, PointStruct, VectorParams
+from qdrant_client.models import (
+    Distance,
+    OptimizersConfigDiff,
+    PointStruct,
+    VectorParams,
+)
 from transformers import AutoTokenizer
 
 REPO = Path(__file__).resolve().parent.parent.parent
@@ -244,9 +249,16 @@ def main() -> None:
     if args.recreate and client.collection_exists(COLLECTION):
         client.delete_collection(COLLECTION)
     if not client.collection_exists(COLLECTION):
+        # indexing_threshold=100: promote segments to HNSW as soon as they have
+        # ~100 points. Qdrant's default (~20k) leaves this collection's ~22k
+        # points distributed across 8 segments fully unindexed -- every query
+        # falls back to brute force. Run scripts/create_qdrant_indices.py
+        # against an existing collection to apply the same setting + payload
+        # indexes idempotently.
         client.create_collection(
             collection_name=COLLECTION,
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+            optimizers_config=OptimizersConfigDiff(indexing_threshold=100),
         )
         print(f"created collection: {COLLECTION}")
     else:
