@@ -10,7 +10,7 @@ Running log of non-obvious things learned while building this pipeline.
 
 | Query | Style | Peak cosine | Notes |
 |---|---|---:|---|
-| `"Left testicular swelling for one day.  Testicular Ultrasound"` | sentence (copied from a doc) | **0.969** | exact-match retrieval |
+| full sentence copied verbatim from a document | sentence (copied from a doc) | **0.969** | exact-match retrieval |
 | `"Retrieve all patients diagnosed with Lymphoblastic Leukemia"` | instruction-style sentence | **0.688** | top hit is a family-history false positive; index case at rank 3 |
 | `"lymphoblastic Leukemia"` | bare concept, 2 words | **0.656** | coherent neighborhood, but low absolute scores |
 
@@ -63,3 +63,17 @@ Peak score drops from 0.97 → 0.66 just by shortening the query, even when the 
 **Why 10% overlap.** Cross-boundary context without duplicating too much. 20 tokens is roughly one short sentence — enough that a concept introduced at the end of one window is still present at the start of the next, so retrieval doesn't miss passages where the answer straddles a chunk boundary. More overlap inflates the vector store for diminishing gain; less risks boundary blind spots.
 
 **Edge case.** A single sentence longer than 200 tokens forms its own window and gets truncated by TEI (`auto_truncate=true`). Rare in MTSamples but worth knowing — if truncation becomes material on another corpus, swap to a real sentence splitter (`syntok`, `nltk.sent_tokenize`) and/or fall back to token-window splitting within oversized sentences.
+
+## TODO: negation-aware embedding
+
+**Status.** Not currently implemented. Revisit and fix.
+
+**Problem.** Dense encoders like MedTE treat `"patient denies chest pain"` and `"patient reports chest pain"` as near-identical in vector space — negation cues (`no`, `denies`, `without`, `ruled out`, `negative for`) barely move the embedding. Retrieval for a query like `"chest pain"` will surface negated mentions alongside positive findings, which is clinically wrong.
+
+**Why it matters here.** Clinical notes are dense with negated findings (ROS, pertinent negatives, ruled-out differentials). Any downstream use — cohort selection, QA, symptom matching — that can't distinguish assertion polarity will produce false positives.
+
+**Options to consider when revisiting.**
+- Assertion/negation tagging at chunk time (NegEx, medspaCy, or a fine-tuned BERT assertion classifier) and store polarity as payload metadata; filter or rerank at query time.
+- Split or flag negated spans before embedding so the encoder sees only positive assertions, or embed negated spans into a separate namespace/field.
+- Cross-encoder reranker trained on assertion-sensitive pairs over the top-k bi-encoder hits.
+- Evaluate negation-aware clinical encoders (e.g. CORE-style, or models trained with hard-negative pairs that include polarity flips).
