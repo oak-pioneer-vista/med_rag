@@ -41,10 +41,11 @@ POINT_NS = uuid.UUID("6f3c0c2a-6c2c-4c9a-b9ea-0ea0d3f8f5a1")
 
 # Sentence-aware windowing: pack whole sentences up to MAX_TOKENS (per the
 # MedTE tokenizer, excluding special tokens) with OVERLAP_TOKENS of trailing
-# sentences shared between neighbors. 15% overlap preserves cross-boundary
-# context without duplicating too much.
-MAX_TOKENS = 350
-OVERLAP_FRAC = 0.15
+# sentences shared between neighbors. 10% overlap preserves cross-boundary
+# context without duplicating too much. 200-token windows keep each chunk
+# tight around a coherent sentence cluster.
+MAX_TOKENS = 200
+OVERLAP_FRAC = 0.10
 OVERLAP_TOKENS = int(MAX_TOKENS * OVERLAP_FRAC)
 
 # TEI's --max-client-batch-size in docker-compose.yml is 64; match it so a

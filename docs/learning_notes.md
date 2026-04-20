@@ -51,3 +51,15 @@ Peak score drops from 0.97 → 0.66 just by shortening the query, even when the 
 - **CUDA compute-capability tag.** The image is built per compute capability (`89-latest` = 8.9 = L4/Ada). Wrong tag = cryptic startup failure. Change it if you move to A100 (8.0), H100 (9.0), etc.
 
 **Takeaway.** For any fan-out embedding pipeline, front the model with TEI (or another dedicated inference server) and make the dask/worker layer a batching HTTP client. You get better GPU utilization, simpler client dependencies, and clean separation of "shape my data" from "run the model" — at the cost of one extra process to operate.
+
+## Chunking: sentence-packed windows, 200 tokens, 10% overlap
+
+**Strategy.** Each section is split into sentences, then greedily packed into windows of up to **200 tokens** (MedTE tokenizer, excluding specials), with ~**10% overlap** (20 tokens ≈ one trailing sentence) carried into the next window. See `_pack_sentences` in `python/ingestion/embed_sections.py`.
+
+**Why sentence-aligned.** Splitting on sentence boundaries keeps each chunk semantically coherent, which matters for a sentence-trained encoder (see note above) — the alternative, fixed-length subword windows, routinely cuts mid-phrase and degrades embedding quality. Packing *multiple* sentences per window (vs. one-sentence-per-chunk) gives the encoder enough context to disambiguate pronouns and short clinical phrases, while staying well inside MedTE's 512-token limit.
+
+**Why 200 tokens.** Tight enough that a chunk is usually a single coherent thought cluster (so retrieval hits the right passage, not a whole section), loose enough that one sentence almost never overflows. Leaves comfortable headroom below MedTE's 512-token max so we don't depend on TEI's `auto_truncate` silently lopping content.
+
+**Why 10% overlap.** Cross-boundary context without duplicating too much. 20 tokens is roughly one short sentence — enough that a concept introduced at the end of one window is still present at the start of the next, so retrieval doesn't miss passages where the answer straddles a chunk boundary. More overlap inflates the vector store for diminishing gain; less risks boundary blind spots.
+
+**Edge case.** A single sentence longer than 200 tokens forms its own window and gets truncated by TEI (`auto_truncate=true`). Rare in MTSamples but worth knowing — if truncation becomes material on another corpus, swap to a real sentence splitter (`syntok`, `nltk.sent_tokenize`) and/or fall back to token-window splitting within oversized sentences.
