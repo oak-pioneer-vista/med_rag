@@ -22,6 +22,9 @@ CREATE CONSTRAINT concept_cui_unique IF NOT EXISTS FOR (c:Concept) REQUIRE c.cui
 CREATE CONSTRAINT atom_aui_unique    IF NOT EXISTS FOR (a:Atom)    REQUIRE a.aui IS UNIQUE;
 CREATE CONSTRAINT semtype_tui_unique IF NOT EXISTS FOR (s:SemanticType) REQUIRE s.tui IS UNIQUE;
 CREATE CONSTRAINT source_sab_unique  IF NOT EXISTS FOR (s:Source) REQUIRE s.sab IS UNIQUE;
+CREATE CONSTRAINT note_doc_id_unique      IF NOT EXISTS FOR (n:Note)    REQUIRE n.doc_id IS UNIQUE;
+CREATE CONSTRAINT section_chunk_id_unique IF NOT EXISTS FOR (s:Section) REQUIRE s.chunk_id IS UNIQUE;
+CREATE CONSTRAINT entity_text_type_unique IF NOT EXISTS FOR (e:Entity) REQUIRE (e.text, e.type) IS UNIQUE;
 CREATE INDEX concept_name IF NOT EXISTS FOR (c:Concept) ON (c.name);
 CREATE INDEX atom_sab_code IF NOT EXISTS FOR (a:Atom) ON (a.sab, a.code);
 CREATE INDEX atom_str_norm IF NOT EXISTS FOR (a:Atom) ON (a.str_norm);
