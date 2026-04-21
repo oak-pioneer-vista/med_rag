@@ -110,6 +110,34 @@ Dropping the competing half of the query lifted peak score from 0.74 → 0.85 an
 - **Disambiguation is the hard part**, not candidate generation. Plan to evaluate against a held-out, hand-linked subset of MTSamples chunks before claiming a linker works.
 - **Off-the-shelf linkers (scispaCy, QuickUMLS, MedCAT)** are worth evaluating as the first pass — they already handle tokenization, abbreviation expansion, and some disambiguation, and can emit CUIs that we then join against the graph. Building a linker from scratch on top of Neo4j lookups is a larger project than it looks.
 
+## Abbreviation resolution beyond Schwartz-Hearst
+
+**Context.** `build_abbreviations.py` runs Schwartz-Hearst on each MTSample doc's joined sections and recovers parenthetically-introduced pairs like `"ORIF" -> "Open reduction and internal fixation"`. The yield is small by design — **79/2,357 docs** with any pair, **143 pairs total** — because most clinical abbreviations (`CHF`, `COPD`, `HTN`, `p.o.`, `b.i.d.`) are never introduced parenthetically. Clinicians write them bare.
+
+**Gap.** S-H can only resolve the subset of abbreviations the author bothered to define inline. For the long tail of bare mentions we need a different approach: dictionary lookup against a pre-built `abbrev → expansion(s)` table, plus disambiguation when an abbreviation maps to multiple expansions (`MS` = multiple sclerosis vs. mitral stenosis vs. morphine sulfate).
+
+**Reference.** Kim, Hurdle, Meystre, [*"Using UMLS Lexical Resources to Disambiguate Abbreviations in Clinical Text"*](https://pmc.ncbi.nlm.nih.gov/articles/PMC3243121/) (AMIA 2011) — the ABRADe system, closest to what we'd want on top of S-H. Their pipeline:
+
+1. **Detection** via dictionary lookup against UMLS **SPECIALIST Lexicon `LRABR`** (an abbreviation ↔ expansion table shipped with UMLS).
+2. **Disambiguation** via either (a) a multi-class SVM trained on synthetic examples (expansion strings swapped for their abbreviation in-context, which auto-labels each training instance), or (b) unsupervised single-link clustering on a 5-word context window (cosine over context bags).
+
+**Reported numbers on clinical notes.**
+- Detection F1 = 66% exact / 75% partial — bounded by LRABR coverage, not by the lookup logic.
+- Semi-supervised SVM disambiguation = **91%** micro-average accuracy across 12 frequent ambiguous abbreviations (5-fold CV).
+- Unsupervised clustering = 58% F1 — weaker, but doesn't require the expansion to appear in training text.
+
+**Limitations we'd inherit.**
+- **`LRABR` is biomedical, not clinical.** The paper explicitly flags misses for clinical-only forms like `p.o.`, `b.i.d.`, `q.h.s.`. Any LRABR-backed tagger has to be supplemented with a clinical-abbrev list (curated CSV plus a pass over MTSamples frequency counts).
+- **Semi-supervised training needs the expansion in text.** For abbreviations like `MD` that rarely appear as "Doctor of Medicine," there are no positive instances to mine — falls back to clustering or manual annotation.
+- **False positives from overgeneral entries.** Noise like `He → Helium` leaks into detection; a corpus-frequency prior is needed to suppress surface-form collisions with common words.
+
+**Where this slots into our pipeline.**
+- S-H stays (cheap, precise when it fires) — pairs already land in each doc JSON under `abbreviations`.
+- The complementary step is a **dictionary-backed tagger**: build `abbrev_dict` from `LRABR` ∪ S-H-mined pairs ∪ a curated clinical list; tag every surface abbreviation in each chunk; when multiple expansions map, disambiguate with a context-bag approach (cheaper to evaluate than SVM) and fall back to the chunk's `:ClinicalDiscipline` specialty prior to break ties.
+- The resolved expansion is a **candidate string for entity linking** (see UMLS/Neo4j grounding section above) rather than the final answer — goal is to feed the Neo4j fulltext lookup with `"mitral stenosis"` instead of `"MS"`, and let the grounder do the CUI-level disambiguation.
+
+**Takeaway.** Schwartz-Hearst and LRABR-style dictionary tagging solve disjoint halves of the abbreviation problem — parenthetical introductions vs. bare mentions. You need both, and on clinical text you also need a clinical-specific supplement because `LRABR` was assembled for PubMed, not discharge summaries.
+
 ## TODO: negation-aware embedding
 
 **Status.** Not currently implemented. Revisit and fix.

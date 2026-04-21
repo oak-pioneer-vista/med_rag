@@ -132,13 +132,24 @@ python python/ingestion/mtsamples/parse_mtsamples.py [--workers 16]
 
 Result: **2,357 per-doc JSONs** under `data/mtsamples_docs/{doc_id:04d}.json`. Each doc carries `doc_id`, `specialty`, `specialty_cui`, `doctype_cui` (explicit mapping or heuristic rule), `sample_name`, merged `keywords`, `alt_specialties` (list of `{specialty, specialty_cui, doctype_cui}` from the dropped cross-filings — every entry has at least one CUI populated), and a list of `Section` records (`chunk_id`, `section_type`, `text`, plus placeholders for `embedding` and `entities` populated downstream). `doctype_cui` is set on 1,634/2,357 docs (specialties without an explicit mapping in `data/doctype_cui.json` and no matching heading rule get `""`).
 
-### 7. Build per-doc abbreviation maps (Schwartz-Hearst)
+### 7. Build per-doc abbreviation maps (Schwartz-Hearst + override + LRABR + MedTE WSD)
+
+Four-stage resolution with provenance tracking. Each doc gets `abbreviations`, `abbreviations_source` (`sh`/`override`/`lrabr`), and `abbreviations_score` (1.0 for S-H and override hits, cosine similarity for LRABR hits) written into its per-doc JSON.
 
 ```bash
-python python/ingestion/mtsamples/build_abbreviations.py
+# prereqs: MedTE TEI up, LRABR staged, parse_mtsamples already run
+docker compose up -d medte
+python python/ingestion/umls/download_specialist_lexicon.py
+python python/ingestion/mtsamples/build_abbreviations.py [--min-score 0.3]
 ```
 
-Runs the Schwartz-Hearst algorithm on each doc's joined section texts to recover `{abbrev: long_form}` pairs (e.g. `"ORIF" -> "Open reduction and internal fixation"`, `"TLIF" -> "Transforaminal Lumbar Interbody Fusion"`), and writes the map back into the same per-doc JSON under a new top-level `abbreviations` field. Sections are joined with `" . "` so S-H's line-wise scan terminates at section boundaries, and the join is necessary because S-H's introduction ("long form (ABBR)") and later mentions often sit in different sections. Expected yield on MTSamples: **79/2,357 docs** with ≥1 pair, **143 total pairs** — hit rate is modest because most clinical abbreviations (CHF, COPD, HTN, …) are never introduced parenthetically in these notes.
+**1. Schwartz-Hearst** over joined section texts (`" . "` separator so the line-wise scan terminates at section boundaries). Highest confidence because the definition is evidence-in-doc.
+
+**2. Curated clinical override** (`data/clinical_abbreviations_override.json`) — a ~60-entry hand-picked list for clinical-canon abbreviations (IV, BUN, CT, MRI, EKG, ABCD, AICD, PTT, PSA, …) whose canonical expansion is overwhelmingly unambiguous in clinical notes. Wins over LRABR; source tag `override`.
+
+**3. LRABR gazetteer + MedTE WSD** for everything else — NLM's SPECIALIST Lexicon LRABR (~62K abbrevs, ~38K with multiple senses) is purpose-built and far cleaner than deriving AB/ACR atoms from MRCONSO (which is dominated by chemo-protocol shorthand and gene symbols). Every LRABR hit is gated by cosine similarity between the doc context and each candidate expansion via MedTE/TEI; winner must clear `--min-score` (default 0.3). This drops the obscure-single-sense-LRABR cases (e.g. `AMSA → amphotericin in solid-state administration`) in docs where the clinical sense isn't in LRABR, rather than injecting them blindly.
+
+Expected yield on MTSamples: **~1,500/2,357 docs** (64%) with ≥1 pair. Typical run: **143 S-H, ~2,400 override, ~1,500 LRABR**; ~4,500 LRABR candidates skipped below threshold. Uniform threshold gate is load-bearing — without it, single-sense LRABR hits for `ABCD`/`AICD`/`PSA`/etc. would inject wrong-sense expansions in clinical docs.
 
 ### 8. Embed section text into Qdrant
 

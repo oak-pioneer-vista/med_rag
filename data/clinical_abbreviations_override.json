@@ -1,0 +1,83 @@
+{
+  "_comment": "Curated clinical abbreviations that win over LRABR lookup. Limited to abbreviations whose clinical sense is overwhelmingly canonical in MTSamples-style notes (not context-dependent). Source for build_abbreviations.py -- hits here get source='override', score=1.0 and bypass embedding disambiguation. If an abbreviation has two legitimately-canonical senses in clinical notes (e.g. PT = prothrombin time OR physical therapy, MCL = medial collateral ligament OR midclavicular line, MS = multiple sclerosis OR morphine sulfate), leave it out and let the embedding WSD decide.",
+  "routes_of_administration": {
+    "IV": "intravenous",
+    "IM": "intramuscular",
+    "PO": "by mouth",
+    "SQ": "subcutaneous",
+    "SC": "subcutaneous"
+  },
+  "dosing_schedules": {
+    "PRN": "as needed",
+    "BID": "twice daily",
+    "TID": "three times daily",
+    "QID": "four times daily",
+    "QD": "once daily",
+    "NPO": "nothing by mouth"
+  },
+  "vitals": {
+    "BP": "blood pressure",
+    "HR": "heart rate",
+    "RR": "respiratory rate",
+    "T": "temperature"
+  },
+  "conditions": {
+    "HTN": "hypertension",
+    "DM": "diabetes mellitus",
+    "CHF": "congestive heart failure",
+    "COPD": "chronic obstructive pulmonary disease",
+    "GERD": "gastroesophageal reflux disease",
+    "CAD": "coronary artery disease",
+    "CVA": "cerebrovascular accident",
+    "DVT": "deep vein thrombosis",
+    "AFib": "atrial fibrillation",
+    "CKD": "chronic kidney disease"
+  },
+  "procedures_devices": {
+    "CABG": "coronary artery bypass graft",
+    "AICD": "automatic implantable cardioverter-defibrillator",
+    "EGD": "esophagogastroduodenoscopy",
+    "ERCP": "endoscopic retrograde cholangiopancreatography",
+    "TEE": "transesophageal echocardiogram",
+    "TTE": "transthoracic echocardiogram"
+  },
+  "labs": {
+    "BMP": "basic metabolic panel",
+    "CMP": "comprehensive metabolic panel",
+    "CBC": "complete blood count",
+    "WBC": "white blood cell count",
+    "RBC": "red blood cell count",
+    "HGB": "hemoglobin",
+    "HCT": "hematocrit",
+    "MCV": "mean corpuscular volume",
+    "MCH": "mean corpuscular hemoglobin",
+    "MCHC": "mean corpuscular hemoglobin concentration",
+    "BUN": "blood urea nitrogen",
+    "INR": "international normalized ratio",
+    "PTT": "partial thromboplastin time",
+    "PSA": "prostate-specific antigen",
+    "UA": "urinalysis",
+    "LFT": "liver function test",
+    "TSH": "thyroid stimulating hormone"
+  },
+  "imaging": {
+    "CT": "computed tomography",
+    "MRI": "magnetic resonance imaging",
+    "CXR": "chest x-ray",
+    "KUB": "kidney, ureter, and bladder"
+  },
+  "cardiology_rhythm": {
+    "EKG": "electrocardiogram",
+    "ECG": "electrocardiogram"
+  },
+  "note_sections": {
+    "HPI": "history of present illness",
+    "ROS": "review of systems",
+    "PMH": "past medical history",
+    "PSH": "past surgical history"
+  },
+  "assessment_mnemonics": {
+    "ABC": "airway, breathing, circulation",
+    "ABCD": "airway, breathing, circulation, disability"
+  }
+}
