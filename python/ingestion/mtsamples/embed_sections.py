@@ -10,7 +10,7 @@ the actual encoding).
 
 Usage:
   docker compose up -d qdrant medte
-  python python/ingestion/embed_sections.py [--workers 16] [--batch 64]
+  python python/ingestion/mtsamples/embed_sections.py [--workers 16] [--batch 64]
 """
 
 from __future__ import annotations

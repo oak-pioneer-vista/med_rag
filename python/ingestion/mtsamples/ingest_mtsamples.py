@@ -5,7 +5,7 @@ sentence-transformers, and upserts into a Qdrant collection.
 
 Usage:
   docker compose up -d          # start Qdrant
-  python python/ingestion/ingest_mtsamples.py
+  python python/ingestion/mtsamples/ingest_mtsamples.py
 """
 
 import pandas as pd
@@ -25,7 +25,7 @@ def main():
     csv_path = DATA_DIR / "mtsamples.csv"
     if not csv_path.exists():
         raise FileNotFoundError(
-            f"{csv_path} not found. Run python/ingestion/download_mtsamples.py first."
+            f"{csv_path} not found. Run python/ingestion/mtsamples/download_mtsamples.py first."
         )
 
     df = pd.read_csv(csv_path)

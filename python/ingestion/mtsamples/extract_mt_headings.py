@@ -11,7 +11,7 @@ Cleaning rules:
     accidental sentence captures
 
 Usage:
-  python python/ingestion/extract_mt_headings.py
+  python python/ingestion/mtsamples/extract_mt_headings.py
 """
 
 import csv

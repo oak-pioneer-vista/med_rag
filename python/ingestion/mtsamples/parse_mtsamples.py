@@ -16,7 +16,7 @@ Outputs:
   - data/mtsamples_docs/{doc_id:04d}.json  (one file per MTSampleDoc)
 
 Usage:
-  python python/ingestion/parse_mtsamples.py [--workers 16]
+  python python/ingestion/mtsamples/parse_mtsamples.py [--workers 16]
 """
 
 import argparse

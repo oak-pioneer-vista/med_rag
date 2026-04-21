@@ -5,7 +5,7 @@ Requires:
   - (`gcloud auth login` or a service account with storage.objects.get)
 
 Usage:
-  python python/ingestion/download_mtsamples.py
+  python python/ingestion/mtsamples/download_mtsamples.py
 """
 
 import subprocess
