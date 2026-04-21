@@ -1,4 +1,4 @@
-"""Per-section NER + span recording for every MTSamples doc (dask parallel).
+"""Per-section NER + span recording for every MTSamples doc (multi-GPU-process).
 
 Runs Stanza's `mimic` pipeline with the `i2b2` NER processor over each
 Section's text (not windowed -- sections are the logical unit here
@@ -28,11 +28,12 @@ downstream consumers can pick the one that fits their use case:
     "end_char"        : offset within the section's text
   }
 
-Parallelism: docs are sharded across `--workers` dask worker processes;
-each worker owns a Stanza pipeline on the GPU, processes all sections
-from its docs in batches of `--batch`, and writes per-doc JSONs back
-to disk. Each entity's character offsets are section-local (Stanza
-returns them relative to the input Document's text).
+Parallelism: doc paths are split into `--workers` equal shards and
+handed to a `multiprocessing.Pool`. The pool's initializer loads
+Stanza once per worker process into a module-level global, so
+(unlike the earlier dask.bag version) workers do not reload the
+pipeline on every task. Each worker processes its shard's sections
+in batches of `--batch` and writes per-doc JSONs back to disk.
 
 Prereqs:
   - data/mtsamples_docs/*.json written by parse_mtsamples.py (and
@@ -51,27 +52,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing as mp
 import os
 import re
 import time
 import uuid
-from functools import partial
 from pathlib import Path
-from typing import Iterable
-
-import dask.bag as db
 
 REPO = Path(__file__).resolve().parent.parent.parent.parent
 DOCS_DIR = REPO / "data" / "mtsamples_docs"
 
-# Token boundary pattern for abbreviation substitution. Alphanumerics +
-# intra-word hyphens (e.g. C-spine) match; surrounding punctuation
-# (commas, parens) does not.
 TOKEN_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9-]*\b")
+
+# Set in each worker by _init_worker(); reused across every pool task on
+# that worker so Stanza's pipeline loads exactly once per process.
+_NLP = None
+_WID = None
 
 
 def resolve_with_abbrevs(text: str, abbrev_upper: dict[str, str]) -> str:
-    """Token-wise substitute known abbreviations with their expansions."""
     if not abbrev_upper:
         return text
 
@@ -105,30 +104,19 @@ def entities_from_stanza_doc(
     return out
 
 
-def _process_partition(
-    partition: Iterable[str],
-    *,
-    batch_size: int,
-    use_gpu: bool,
-) -> list[dict]:
-    """Dask worker entry point.
+def _init_worker(use_gpu: bool) -> None:
+    """Pool initializer -- called once per worker process at pool startup.
 
-    Loads Stanza once per worker (skipping mimic's lemma/pos/depparse
-    processors, which the recent Stanza releases fail to load for the
-    mimic model), then processes every section in this partition's docs
-    in batches of `batch_size`. Writes each per-doc JSON back in place
-    so the driver has no post-processing work to do.
+    Loads the Stanza pipeline into module-level globals so subsequent
+    pool.map tasks on this worker reuse the same pipeline rather than
+    reloading.
     """
     import stanza
 
-    wid = f"{os.getpid()}/{uuid.uuid4().hex[:6]}"
-    paths = [Path(p) for p in partition]
-    if not paths:
-        return [{"wid": wid, "docs": 0, "ents": 0, "resolved_diff": 0, "elapsed_s": 0.0}]
-
-    print(f"[worker {wid}] loading pipeline for {len(paths)} docs (use_gpu={use_gpu})",
-          flush=True)
-    nlp = stanza.Pipeline(
+    global _NLP, _WID
+    _WID = f"{os.getpid()}/{uuid.uuid4().hex[:6]}"
+    print(f"[worker {_WID}] loading pipeline (use_gpu={use_gpu})", flush=True)
+    _NLP = stanza.Pipeline(
         lang="en",
         package=None,
         processors={"tokenize": "mimic", "ner": "i2b2"},
@@ -136,8 +124,18 @@ def _process_partition(
         verbose=False,
         download_method="reuse_resources",
     )
+    print(f"[worker {_WID}] pipeline ready", flush=True)
 
-    # Load all docs for this partition; flatten non-empty sections.
+
+def _process_shard(args: tuple) -> dict:
+    """Pool worker task: process one shard's docs with the cached pipeline."""
+    import stanza
+
+    shard_paths, batch_size = args
+    paths = [Path(p) for p in shard_paths]
+    if not paths:
+        return {"wid": _WID, "docs": 0, "ents": 0, "resolved_diff": 0, "elapsed_s": 0.0}
+
     docs = [(p, json.loads(p.read_text(encoding="utf-8"))) for p in paths]
     items: list[tuple[int, int, str]] = []
     for di, (_, d) in enumerate(docs):
@@ -148,7 +146,8 @@ def _process_partition(
             else:
                 section["entities"] = []
 
-    print(f"[worker {wid}] batching {len(items)} sections at batch={batch_size}",
+    print(f"[worker {_WID}] batching {len(items)} sections from {len(paths)} docs "
+          f"at batch={batch_size}",
           flush=True)
 
     total_ents = 0
@@ -157,7 +156,7 @@ def _process_partition(
     for bi in range(0, len(items), batch_size):
         chunk = items[bi : bi + batch_size]
         stanza_docs = [stanza.Document([], text=t) for _, _, t in chunk]
-        nlp.bulk_process(stanza_docs)
+        _NLP.bulk_process(stanza_docs)
 
         for (di, si, section_text), sdoc in zip(chunk, stanza_docs):
             abbrev_map = docs[di][1].get("abbreviations") or {}
@@ -171,7 +170,7 @@ def _process_partition(
 
         done = min(bi + batch_size, len(items))
         rate = done / max(time.time() - t0, 1e-9)
-        print(f"[worker {wid}]   {done:>6}/{len(items)} sections  "
+        print(f"[worker {_WID}]   {done:>6}/{len(items)} sections  "
               f"({rate:.1f} sec/s)",
               flush=True)
 
@@ -179,24 +178,36 @@ def _process_partition(
         p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
 
     elapsed = time.time() - t0
-    print(f"[worker {wid}] done: {len(paths)} docs, {total_ents} ents, "
+    print(f"[worker {_WID}] done: {len(paths)} docs, {total_ents} ents, "
           f"{n_resolved_diff} resolved_diff in {elapsed:.1f}s",
           flush=True)
-    return [{
-        "wid": wid,
+    return {
+        "wid": _WID,
         "docs": len(paths),
         "ents": total_ents,
         "resolved_diff": n_resolved_diff,
         "elapsed_s": elapsed,
-    }]
+    }
+
+
+def _shard(seq: list, n: int) -> list[list]:
+    """Split `seq` into `n` roughly-equal contiguous shards."""
+    k, m = divmod(len(seq), n)
+    shards = []
+    i = 0
+    for shard_idx in range(n):
+        size = k + (1 if shard_idx < m else 0)
+        shards.append(seq[i : i + size])
+        i += size
+    return shards
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--docs", type=Path, default=DOCS_DIR)
     ap.add_argument("--workers", type=int, default=6,
-                    help="dask worker processes (each loads one Stanza pipeline; "
-                         "on L4, 6 fits in VRAM with headroom)")
+                    help="multiprocessing worker count (each loads one Stanza "
+                         "pipeline; on L4, 6 fits in VRAM with headroom)")
     ap.add_argument("--batch", type=int, default=1024,
                     help="sections per Stanza bulk_process batch (per worker)")
     ap.add_argument("--cpu", action="store_true",
@@ -211,25 +222,37 @@ def main() -> None:
         )
 
     use_gpu = not args.cpu
-    print(f"dispatching {len(paths):,} docs across {args.workers} dask workers "
-          f"(use_gpu={use_gpu}, batch={args.batch})",
+    workers = max(1, min(args.workers, len(paths)))
+    shards = _shard(paths, workers)
+    sizes = [len(s) for s in shards]
+    print(f"dispatching {len(paths):,} docs to {workers} workers "
+          f"(shards={sizes}, use_gpu={use_gpu}, batch={args.batch})",
           flush=True)
 
-    bag = db.from_sequence(paths, npartitions=args.workers)
-    worker_fn = partial(_process_partition, batch_size=args.batch, use_gpu=use_gpu)
-    results = bag.map_partitions(worker_fn).compute(
-        scheduler="processes", num_workers=args.workers
-    )
+    # `spawn` start method -- cleaner for CUDA (avoids inherited CUDA
+    # context from the parent); each child initializes its own context
+    # in `_init_worker`.
+    ctx = mp.get_context("spawn")
+    wall_t0 = time.time()
+    with ctx.Pool(processes=workers, initializer=_init_worker,
+                  initargs=(use_gpu,)) as pool:
+        results = pool.map(
+            _process_shard,
+            [(shard, args.batch) for shard in shards],
+        )
 
     total = {"docs": 0, "ents": 0, "resolved_diff": 0}
     for r in results:
         for k in total:
             total[k] += r.get(k, 0)
 
-    wall_t0 = min((r.get("elapsed_s", 0) for r in results), default=0.0)
+    wall = time.time() - wall_t0
+    per_worker = sorted([r.get("elapsed_s", 0.0) for r in results])
     print(
         f"done: {total['ents']:,} entities across {total['docs']:,} docs "
-        f"({total['resolved_diff']:,} with resolved_text != recognized_text)",
+        f"({total['resolved_diff']:,} with resolved_text != recognized_text) "
+        f"in {wall:.1f}s wall  "
+        f"[per-worker work {min(per_worker):.1f}..{max(per_worker):.1f}s]",
         flush=True,
     )
 
