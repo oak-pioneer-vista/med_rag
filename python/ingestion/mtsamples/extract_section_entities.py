@@ -45,7 +45,7 @@ Prereqs:
     nvidia/cudnn/lib + nvidia/cublas/lib so torch's bundled libs win.
 
 Usage:
-  python python/ingestion/mtsamples/extract_section_entities.py [--workers 6] [--batch 1024] [--cpu]
+  python python/ingestion/mtsamples/extract_section_entities.py [--workers 8] [--batch 16] [--cpu]
 """
 
 from __future__ import annotations
@@ -237,11 +237,16 @@ def _shard_lpt(paths: list[str], n: int) -> list[list[str]]:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--docs", type=Path, default=DOCS_DIR)
-    ap.add_argument("--workers", type=int, default=6,
-                    help="multiprocessing worker count (each loads one Stanza "
-                         "pipeline; on L4, 6 fits in VRAM with headroom)")
-    ap.add_argument("--batch", type=int, default=1024,
-                    help="sections per Stanza bulk_process batch (per worker)")
+    ap.add_argument("--workers", type=int, default=8,
+                    help="multiprocessing worker count. Tuned via sweep on L4: "
+                         "8 is optimal; 6 within 2s of best, >=12 regress as CUDA "
+                         "context-switching eats the marginal parallelism, 32 OOMs")
+    ap.add_argument("--batch", type=int, default=16,
+                    help="sections per Stanza bulk_process batch (per worker). "
+                         "Tiny batches look pathological but within-shard length-"
+                         "bucketing means padding is near-zero, so 16/64/1024 are "
+                         "within 2s of each other; 16 wins by a hair and keeps "
+                         "activation memory lowest for the high-worker case")
     ap.add_argument("--cpu", action="store_true",
                     help="force CPU (default: use GPU if available)")
     args = ap.parse_args()

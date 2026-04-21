@@ -154,12 +154,22 @@ Expected yield on MTSamples: **~1,500/2,357 docs** (64%) with ≥1 pair. Typical
 ### 8. Extract per-section entities with spans (Stanza i2b2 NER)
 
 ```bash
-python python/ingestion/mtsamples/extract_section_entities.py [--cpu]
+# GPU path (fastest): if host cuDNN lags torch's bundled cuDNN, prepend the venv's
+# nvidia libs so torch's bundled cuDNN wins. Symptom without it: "cuDNN version
+# incompatibility" at pipeline-load time.
+VENV_LIB=.venv/lib/python3.10/site-packages
+LD_LIBRARY_PATH="$VENV_LIB/nvidia/cudnn/lib:$VENV_LIB/nvidia/cublas/lib:$LD_LIBRARY_PATH" \
+  python python/ingestion/mtsamples/extract_section_entities.py [--workers 8] [--batch 16]
+
+# CPU fallback (~10x slower, no driver fuss):
+python python/ingestion/mtsamples/extract_section_entities.py --cpu
 ```
 
-Runs Stanza's `mimic/i2b2` NER over each Section's text (sections are the logical unit — not Qdrant-aligned windows) and fills each Section's `entities` list in the per-doc JSON. Each entity record carries surface form, i2b2 type (`PROBLEM` / `TEST` / `TREATMENT`), section-local `start_char` / `end_char`, and an optional `resolved_text` when the doc's `abbreviations` map (step 7) can substitute an abbreviation inside the entity's text (e.g. `"CXR"` inside a `TEST` entity → `resolved_text: "chest x-ray"`).
+Runs Stanza's `mimic/i2b2` NER over each Section's text (sections are the logical unit — not Qdrant-aligned windows) and fills each Section's `entities` list in the per-doc JSON. Each entity record carries three text views — `surface_text` (literal section-text slice), `recognized_text` (Stanza's output), `resolved_text` (with abbreviations from step 7 substituted in) — plus i2b2 type (`PROBLEM` / `TEST` / `TREATMENT`) and section-local `start_char` / `end_char`.
 
-Sections are batched through Stanza (default 128/batch) for throughput. GPU is preferred; fall back to `--cpu` if the host's cuDNN mismatches torch's bundled cuDNN (typical symptom: `cuDNN version incompatibility` at pipeline-load time). Expected yield on MTSamples: **~120K entities across ~18K non-empty sections** in ~16 min on CPU, with ~4K entities carrying an abbreviation-resolved surface form.
+Parallelism uses `multiprocessing.Pool` with `spawn` start method so each worker gets a clean CUDA context; doc paths are sharded via **Longest-Processing-Time-first bin packing** on total section char-count (keeps the heaviest shard within ~4/3 of the mean, vs equal-doc-count sharding that lumped several 2K-token PROCEDURE notes together and stretched wall time by 30%+). Within each worker, sections are **length-sorted descending** before batching so Stanza's padding-to-longest-in-batch waste is near-zero on a corpus with p50=23 / p99=863 / max=2,819 MedTE tokens.
+
+Tuned defaults (`--workers 8 --batch 16`) from a sweep on L4: 8 is the knee — 6 is within 2s, ≥12 regresses as CUDA context-switching across processes overtakes the marginal gain, 32 OOMs (each pipeline + activations is ~700 MB–1 GB on GPU). Batch size is nearly irrelevant with length-bucketing in place (16/64/1024 all within 2s). Expected on MTSamples: **~121K entities across ~18K non-empty sections in ~97s on L4**; ~16 min if you fall back to `--cpu`. ~4K entities (3.4%) get a `resolved_text` that differs from `recognized_text`.
 
 This is distinct from `python/ingestion/mtsamples/extract_entities.py`, which targets Qdrant-aligned chunk windows for the retrieval pipeline. The two produce complementary artifacts: section entities live inside the per-doc JSON (coarse-grained, directly usable by the Neo4j loader's Section→Entity layer), while chunk entities live in `data/entities/chunk_entities.jsonl` and key off `chunk_id` for joins with Qdrant points.
 

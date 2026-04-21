@@ -51,6 +51,27 @@ Against a verbatim sentence copied from a source document, the same encoder peak
 
 **Takeaway.** For any fan-out embedding pipeline, front the model with TEI (or another dedicated inference server) and make the dask/worker layer a batching HTTP client. You get better GPU utilization, simpler client dependencies, and clean separation of "shape my data" from "run the model" — at the cost of one extra process to operate.
 
+## Batching NER inference without a dedicated server
+
+**Context.** TEI (previous section) covers the embedding case: one inference server, many HTTP clients, server-side dynamic batching. NER doesn't have that luxury — Stanza's `mimic/i2b2` biLSTM-CRF runs in-process on each worker, with no "NER server" to front it. `python/ingestion/mtsamples/extract_section_entities.py` processes ~18K non-empty sections across 2,357 docs; the naive "iterate and call `nlp(text)` per section" leaves the GPU at single-digit utilization because every call is effectively a batch of 1. This note documents the three knobs that matter when you own the batching yourself.
+
+**What Stanza's `bulk_process` actually does.** Standard padded-batch inference: every sequence in a batch gets right-padded to the longest sequence in that batch, and the CRF decode runs at that padded length. On MTSamples, section lengths span **p50=23, p99=863, max=2,819 MedTE tokens**. If you bulk-process in the order the parser emitted sections, a single batch routinely mixes a 2K-token `PROCEDURE` section with sixty short `ANESTHESIA:` headers — and the whole batch's wall time is set by the long outlier while the short ones ride along on padding tokens. Classic padded-batch tax.
+
+**Fix 1: length-sort within a batch.** Sort the section list descending by text length before slicing into fixed-size batches. Similar-length sequences now share a batch, so short batches finish fast on minimal padding and long batches do only the work they genuinely need. Output order is preserved by writing results back through `(doc_idx, section_idx)` rather than list position. Cost: one `O(n log n)` sort at worker startup; no runtime overhead after that.
+
+**Fix 2: load-balance shards by compute weight, not doc count.** With multiple worker processes, naive "equal doc count per shard" leaves the slowest shard holding the corpus's long procedural notes — a classic makespan problem. Weight each doc by total section character count (a cheap proxy for Stanza's biLSTM runtime), sort docs descending, and greedy-assign each to the currently-least-loaded shard — **Longest-Processing-Time-first** bin packing. Gives makespan within 4/3 of optimal by construction and in practice flattens the slowest-shard tail from **~95s → <75s** on this corpus vs the equal-count baseline.
+
+**Fix 3: load the pipeline once per worker, not per task.** An earlier cut used `dask.bag.map_partitions`, which reloads the pipeline at every partition boundary — seconds of wasted startup cost on repeated runs. Switched to `multiprocessing.Pool` with a pool **initializer** that loads Stanza into a module-level global (`_NLP`), so subsequent pool tasks on that worker reuse the already-resident pipeline. Also switched to the `spawn` start method: fork inherits whatever CUDA context was already initialized in the parent, which under Stanza/Torch produced intermittent "invalid device context" failures. Spawn gives each child a clean process to initialize its own CUDA context in.
+
+**Why none of this shows up in the TEI playbook.**
+- TEI already does server-side dynamic batching: you post whatever you have, the server queues, regroups, and pads per-batch internally. Client length-sorting gives nothing.
+- TEI holds exactly one copy of the weights in the server process. No per-worker model load to amortize.
+- Spawn-vs-fork doesn't matter because TEI's CUDA context lives outside your Python workers entirely — clients touch nothing CUDA-related.
+
+So "front it with a server" isn't a universal answer — it's the right shape only when such a server exists (embeddings via TEI, generation via vLLM, etc.). For in-process inference (Stanza NER, scispaCy, raw `transformers` pipelines), **you own the batching**, and (1) length-sort inputs, (2) LPT-balance shards, (3) cache the pipeline per worker are the three knobs that actually move throughput.
+
+**Takeaway.** Padded-batch inference is pay-for-the-longest. When you're stuck batching in-process, length-sort before batching, load-balance shards by compute weight instead of item count, and load the model once per worker via a pool initializer. All three are mechanical to add, compose multiplicatively, and don't require any change to the model itself.
+
 ## Chunking: sentence-packed windows, 200 tokens, 10% overlap
 
 **Strategy.** Each section is split into sentences, then greedily packed into windows of up to **200 tokens** (MedTE tokenizer, excluding specials), with ~**10% overlap** (20 tokens ≈ one trailing sentence) carried into the next window. See `_pack_sentences` in `python/ingestion/mtsamples/embed_sections.py`.
