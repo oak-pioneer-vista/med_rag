@@ -151,7 +151,19 @@ python python/ingestion/mtsamples/build_abbreviations.py [--min-score 0.3]
 
 Expected yield on MTSamples: **~1,500/2,357 docs** (64%) with ≥1 pair. Typical run: **143 S-H, ~2,400 override, ~1,500 LRABR**; ~4,500 LRABR candidates skipped below threshold. Uniform threshold gate is load-bearing — without it, single-sense LRABR hits for `ABCD`/`AICD`/`PSA`/etc. would inject wrong-sense expansions in clinical docs.
 
-### 8. Embed section text into Qdrant
+### 8. Extract per-section entities with spans (Stanza i2b2 NER)
+
+```bash
+python python/ingestion/mtsamples/extract_section_entities.py [--cpu]
+```
+
+Runs Stanza's `mimic/i2b2` NER over each Section's text (sections are the logical unit — not Qdrant-aligned windows) and fills each Section's `entities` list in the per-doc JSON. Each entity record carries surface form, i2b2 type (`PROBLEM` / `TEST` / `TREATMENT`), section-local `start_char` / `end_char`, and an optional `resolved_text` when the doc's `abbreviations` map (step 7) can substitute an abbreviation inside the entity's text (e.g. `"CXR"` inside a `TEST` entity → `resolved_text: "chest x-ray"`).
+
+Sections are batched through Stanza (default 128/batch) for throughput. GPU is preferred; fall back to `--cpu` if the host's cuDNN mismatches torch's bundled cuDNN (typical symptom: `cuDNN version incompatibility` at pipeline-load time). Expected yield on MTSamples: **~120K entities across ~18K non-empty sections** in ~16 min on CPU, with ~4K entities carrying an abbreviation-resolved surface form.
+
+This is distinct from `python/ingestion/mtsamples/extract_entities.py`, which targets Qdrant-aligned chunk windows for the retrieval pipeline. The two produce complementary artifacts: section entities live inside the per-doc JSON (coarse-grained, directly usable by the Neo4j loader's Section→Entity layer), while chunk entities live in `data/entities/chunk_entities.jsonl` and key off `chunk_id` for joins with Qdrant points.
+
+### 9. Embed section text into Qdrant
 
 Windows each `Section` into sentence packs of ≤200 tokens with 10% overlap, embeds every window by POSTing batches of up to 64 texts to the MedTE TEI service on `localhost:8080`, and upserts the vectors into the `mtsamples_sections` Qdrant collection. Parallelism is via `dask.bag.map_partitions` — each of the default 16 worker processes owns its own HTTP session and local tokenizer (used only for counting tokens during packing; the GPU-resident TEI container does all the encoding).
 
@@ -173,7 +185,7 @@ Instruction-style query `"Retrieve all patients diagnosed with Lymphoblastic Leu
 
 Takeaways: (1) MedTE + mean pooling retrieves a clinically coherent oncology neighborhood (leukemia → related heme/onc consults → chemo access devices). (2) Instruction-style query phrasing and the family-history-vs-index-case distinction both trip the encoder — the top hit being a family-history surface match is expected bi-encoder behavior; a reranker (cross-encoder) or an instruction-tuned embedder (`intfloat/e5-*`, BGE) would be needed to fix it. (3) Post-dedupe the top-k now surfaces genuinely distinct clinical neighbors instead of near-identical cross-filings — compare to the pre-dedupe run where the target doc occupied ~half of the top-50 as four cross-filed copies.
 
-### 9. Create Qdrant payload indexes
+### 10. Create Qdrant payload indexes
 
 ```bash
 python scripts/create_qdrant_indices.py
@@ -186,7 +198,7 @@ Idempotent. Ensures `indexing_threshold=100` (matches what `embed_sections.py` s
 
 Without these, filters like `doc_id == 2306` or `specialty == "Nephrology"` are O(n) scans over 22K payloads on every query. Re-run whenever a new filterable field is introduced; existing indexes are a no-op.
 
-### 10. Create Neo4j constraints, indexes, and tier labels
+### 11. Create Neo4j constraints, indexes, and tier labels
 
 ```bash
 bash scripts/create_neo4j_indices.sh
