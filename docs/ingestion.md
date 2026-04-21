@@ -159,21 +159,108 @@ Expected yield on MTSamples: **~1,500/2,357 docs** (64%) with ≥1 pair. Typical
 # incompatibility" at pipeline-load time.
 VENV_LIB=.venv/lib/python3.10/site-packages
 LD_LIBRARY_PATH="$VENV_LIB/nvidia/cudnn/lib:$VENV_LIB/nvidia/cublas/lib:$LD_LIBRARY_PATH" \
-  python python/ingestion/mtsamples/extract_section_entities.py [--workers 8] [--batch 16]
+  python python/ingestion/mtsamples/extract_section_entities.py [--workers 8] [--batch 64]
 
 # CPU fallback (~10x slower, no driver fuss):
 python python/ingestion/mtsamples/extract_section_entities.py --cpu
 ```
 
-Runs Stanza's `mimic/i2b2` NER over each Section's text (sections are the logical unit — not Qdrant-aligned windows) and fills each Section's `entities` list in the per-doc JSON. Each entity record carries three text views — `surface_text` (literal section-text slice), `recognized_text` (Stanza's output), `resolved_text` (with abbreviations from step 7 substituted in) — plus i2b2 type (`PROBLEM` / `TEST` / `TREATMENT`) and section-local `start_char` / `end_char`.
+Runs Stanza's `mimic/i2b2` NER over each Section's text (sections are the logical unit — not Qdrant-aligned windows) and fills each Section's `entities` list in the per-doc JSON. Each entity record carries `surface_text` (literal section-text slice), `recognized_text` (Stanza's output), i2b2 `type` (`PROBLEM` / `TEST` / `TREATMENT`), and section-local `start_char` / `end_char`.
+
+**This step is deliberately idempotent and text-normalization-free.** All derived text fields (`resolved_text`, `expanded_text`) are computed in step 9 from these raw records, so iterating on normalization rules doesn't require re-running Stanza.
 
 Parallelism uses `multiprocessing.Pool` with `spawn` start method so each worker gets a clean CUDA context; doc paths are sharded via **Longest-Processing-Time-first bin packing** on total section char-count (keeps the heaviest shard within ~4/3 of the mean, vs equal-doc-count sharding that lumped several 2K-token PROCEDURE notes together and stretched wall time by 30%+). Within each worker, sections are **length-sorted descending** before batching so Stanza's padding-to-longest-in-batch waste is near-zero on a corpus with p50=23 / p99=863 / max=2,819 MedTE tokens.
 
-Tuned defaults (`--workers 8 --batch 16`) from a sweep on L4: 8 is the knee — 6 is within 2s, ≥12 regresses as CUDA context-switching across processes overtakes the marginal gain, 32 OOMs (each pipeline + activations is ~700 MB–1 GB on GPU). Batch size is nearly irrelevant with length-bucketing in place (16/64/1024 all within 2s). Expected on MTSamples: **~121K entities across ~18K non-empty sections in ~97s on L4**; ~16 min if you fall back to `--cpu`. ~4K entities (3.4%) get a `resolved_text` that differs from `recognized_text`.
+Tuned defaults (`--workers 8 --batch 64`) from two sweeps on L4:
+- **Workers**: 8 is the knee. 6 within 2s; ≥12 regresses as CUDA context-switching across processes overtakes the marginal gain; 32 OOMs (each pipeline + activations is ~700 MB–1 GB on GPU).
+- **Batch**: clean U-curve with a flat bottom at **32–128** (~91s); batch=8 pays a 17s dispatch-overhead tax, batch=512 pays ~2s as the length-sorted first batch gets too big. 64 sits in the middle of the minimum with activation headroom.
+
+Expected on MTSamples: **~121K entities across ~18K non-empty sections in ~91s on L4**; ~16 min on `--cpu`.
 
 This is distinct from `python/ingestion/mtsamples/extract_entities.py`, which targets Qdrant-aligned chunk windows for the retrieval pipeline. The two produce complementary artifacts: section entities live inside the per-doc JSON (coarse-grained, directly usable by the Neo4j loader's Section→Entity layer), while chunk entities live in `data/entities/chunk_entities.jsonl` and key off `chunk_id` for joins with Qdrant points.
 
-### 9. Embed section text into Qdrant
+### 9. Normalize per-section entities (strip articles + expand abbreviations)
+
+```bash
+python python/ingestion/mtsamples/normalize_section_entities.py
+```
+
+Derives two text fields per entity record from the `recognized_text` written by step 8:
+- `resolved_text` — `recognized_text` with articles (`a`/`an`/`the`) removed and whitespace collapsed. Reserved as the NER canonical surface; future string-level normalization rules chain in here.
+- `expanded_text` — `resolved_text` with known abbreviations substituted using the doc's `abbreviations` map (step 7), then article-stripped again in case the expansion introduced one. Use this for UMLS/Neo4j grounding and dense-retrieval keying, where the expanded form matches more Concept atoms.
+
+Pure Python string work — no GPU, no heavy compute. **Typically finishes in ~2s over all 18K entities**, vs the ~91s cost of re-running NER. That's the payoff of keeping the layers separate: iterate on the stopword list, the token regex, or any new normalization rule in a fast edit-run-inspect loop without paying the NER tax each time. Expected on MTSamples: **~32K entities get an article stripped (26%)**, **~4K entities (3.4%)** get an abbrev expansion that changes `expanded_text` relative to `resolved_text`.
+
+### 10. Link specialties to UMLS CUIs
+
+```bash
+python python/ingestion/mtsamples/link_specialty_to_cui.py
+```
+
+Resolves both `doc['specialty']` and every `doc['alt_specialties'][i]['specialty']` to UMLS CUIs in a single pass. Each unique specialty string (there are ~40 across the corpus, including cross-filing-only ones like `Diets and Nutritions`) is looked up via exact `Atom.str_norm` match first, fulltext fallback on `concept_name_fts` for the rest. Overrides the CUIs seeded from `data/specialty_cui.json` during parse — with UMLS loaded, the graph is authoritative.
+
+Expected: all 40 unique specialty strings resolve (~0.3s); ~1,400 alt_specialty entries get updated CUIs across ~1,270 docs.
+
+### 11. Link section types to UMLS CUIs
+
+```bash
+python python/ingestion/mtsamples/link_sections_to_cui.py
+```
+
+For every Section's `section_type`, applies a small alias map (`HPI` → `history of present illness`, `PMH` → `past medical history`, `ROS` → `review of systems`, `HEENT` → `head ears eyes nose throat`, etc.) before the Neo4j lookup, so short-form and full-form headings resolve to the same CUI (critical for downstream grouping). Exact match + fulltext fallback. Writes `section_cui` on each section in the per-doc JSONs.
+
+Expected: **~1,736/1,778 unique section_type values resolved (97.6%)**; `HPI` and `HISTORY OF PRESENT ILLNESS` both → `C0262512`. ~52s on a warm Neo4j.
+
+### 12. Link entities to UMLS CUIs + TUIs (dask map-reduce)
+
+```bash
+python python/ingestion/mtsamples/link_entities_to_cui.py [--workers 16] [--batch 500]
+```
+
+Resolves each entity to a UMLS concept (CUI) *and* its semantic types (TUIs) — the biggest lookup workload in the pipeline, so the architecture is built around three separate parallelism stages:
+
+1. **Dask map-reduce dedup** — `dask.bag` over per-doc JSON paths, N worker processes. Each partition worker reads its shard and emits `{entity_hash: expanded_text_lower}` (content-addressable `sha1(text)[:16]` keys). Worker dicts are union-merged into one global dedup map. ~121K entity mentions collapse to **~49K unique hashes** so Neo4j never sees a duplicate.
+
+2. **Exact CUI pass** — single session, batched `UNWIND + MATCH` on `Atom.str_norm`. ~22% of hashes hit exact in ~5s.
+
+3. **Fulltext CUI fallback** — residual ~38K hashes split across `--workers` (default 16) processes, each with its own Neo4j session, batched through `UNWIND + CALL { CALL db.index.fulltext.queryNodes(...) }`. Lucene special-char escape + alphanumeric guard pre-filter. Finishes in ~3 min wall on a local Neo4j, vs. ~10 min single-threaded or ~15 min per-query.
+
+4. **TUI pass** — unique CUIs (~27K) batched via `UNWIND + MATCH (c)-[:HAS_SEMTYPE]->(st)`, collecting `st.tui` + `st.name` lists. One concept can have multiple semantic types (e.g. CD4 → `[T192, T129, T116]` = Receptor + Immunologic Factor + Protein). ~2.5s.
+
+5. **Write-back** — every entity mention gets stamped with its resolved payload by `entity_hash` lookup.
+
+Fields written per entity:
+
+| field | type | purpose |
+|---|---|---|
+| `entity_hash` | `str` (16 hex) | Deterministic dedup key for joins, safe for use as a graph-node ID downstream. |
+| `cui` | `str` | UMLS Concept Unique Identifier, or `""`. |
+| `cui_name` | `str` | Matched `Concept.name` (for audit). |
+| `cui_match` | `str` | `"exact"` / `"fulltext/<score>"` / `""`. |
+| `tuis` | `list[str]` | Semantic Type Unique Identifiers (e.g. `["T047"]` = Disease or Syndrome). |
+| `tui_names` | `list[str]` | Human-readable TUI names. |
+
+Expected on MTSamples: **~119K of 121K entities linked (~98%)**, 100% of linked entities carry ≥1 TUI. Top semantic types across the corpus: **T033 Finding (16.6K), T061 Therapeutic/Preventive Procedure (13.8K), T047 Disease or Syndrome (12.6K), T074 Medical Device (9.9K), T121 Pharmacologic Substance (8.9K), T184 Sign or Symptom (8.3K)** — i.e. the distribution a clinical corpus should produce.
+
+### 13. Sentence-chunk sections + tag each sentence with linked entity sets
+
+```bash
+python python/ingestion/mtsamples/chunk_sentences.py [--workers 8] [--batch 128]
+```
+
+For every Section, splits the text into sentences using **Stanza's `mimic` clinical tokenizer** (same tokenizer used by step 8 for NER — handles medical abbreviations like `q.i.d.`, `2.5 mg`, `Dr.`, and does better on MTSamples' comma-pseudo-paragraph style than a bare regex). For each sentence, scans for the presence of any linked entity's surface form (word-boundary, case-insensitive) via a single compiled alternation regex per doc. Matched entities contribute to three per-sentence sets:
+
+- `cuis` — sorted list of UMLS CUIs covered in this sentence
+- `tuis` — sorted list of semantic TUIs in this sentence
+- `surface_forms` — sorted list of matched entity surface forms (lowercased)
+
+Written back as `section.sentences = [{text, cuis, tuis, surface_forms}, ...]`.
+
+Parallelism is `mp.Pool` with `spawn` start method (same pattern as step 8). Each worker loads Stanza once in its initializer and processes its shard's sections in batches of `--batch` via `nlp.bulk_process`. Per-doc surface-form indices are compiled once per doc and reused across all sections of that doc, so a sentence is scanned against all candidate surface forms in one pass.
+
+Expected on MTSamples: **~83K sentences across 18K sections in ~20s wall on L4 (8 workers, batch=128)**; ~74% of sentences carry ≥1 CUI hit. Stanza catches ~800 more sentence boundaries than the naive regex, mostly in operative-note comma-joined clauses.
+
+### 14. Embed section text into Qdrant
 
 Windows each `Section` into sentence packs of ≤200 tokens with 10% overlap, embeds every window by POSTing batches of up to 64 texts to the MedTE TEI service on `localhost:8080`, and upserts the vectors into the `mtsamples_sections` Qdrant collection. Parallelism is via `dask.bag.map_partitions` — each of the default 16 worker processes owns its own HTTP session and local tokenizer (used only for counting tokens during packing; the GPU-resident TEI container does all the encoding).
 
@@ -195,7 +282,7 @@ Instruction-style query `"Retrieve all patients diagnosed with Lymphoblastic Leu
 
 Takeaways: (1) MedTE + mean pooling retrieves a clinically coherent oncology neighborhood (leukemia → related heme/onc consults → chemo access devices). (2) Instruction-style query phrasing and the family-history-vs-index-case distinction both trip the encoder — the top hit being a family-history surface match is expected bi-encoder behavior; a reranker (cross-encoder) or an instruction-tuned embedder (`intfloat/e5-*`, BGE) would be needed to fix it. (3) Post-dedupe the top-k now surfaces genuinely distinct clinical neighbors instead of near-identical cross-filings — compare to the pre-dedupe run where the target doc occupied ~half of the top-50 as four cross-filed copies.
 
-### 10. Create Qdrant payload indexes
+### 15. Create Qdrant payload indexes
 
 ```bash
 python scripts/create_qdrant_indices.py
@@ -208,7 +295,7 @@ Idempotent. Ensures `indexing_threshold=100` (matches what `embed_sections.py` s
 
 Without these, filters like `doc_id == 2306` or `specialty == "Nephrology"` are O(n) scans over 22K payloads on every query. Re-run whenever a new filterable field is introduced; existing indexes are a no-op.
 
-### 11. Create Neo4j constraints, indexes, and tier labels
+### 16. Create Neo4j constraints, indexes, and tier labels
 
 ```bash
 bash scripts/create_neo4j_indices.sh

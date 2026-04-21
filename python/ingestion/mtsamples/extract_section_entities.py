@@ -4,8 +4,7 @@ Runs Stanza's `mimic` pipeline with the `i2b2` NER processor over each
 Section's text (not windowed -- sections are the logical unit here
 because downstream grounding lines up section -> Concept, not chunk ->
 Concept). Each section's `entities` list in its per-doc JSON is filled
-with one record per mention, carrying three text representations so
-downstream consumers can pick the one that fits their use case:
+with one record per mention:
 
   {
     "surface_text"    : literal slice section_text[start_char:end_char]
@@ -16,17 +15,16 @@ downstream consumers can pick the one that fits their use case:
                         across tokens, so it may differ on adjacent-
                         punctuation edges. Use this for model-derived
                         text matching.
-    "resolved_text"   : `recognized_text` with any known abbreviations
-                        (from the doc's `abbreviations` map built in
-                        build_abbreviations.py) substituted with their
-                        expansions. Equal to `recognized_text` when no
-                        substitution fires. Use this for UMLS/Neo4j
-                        grounding and dense-retrieval keying, where the
-                        expanded form matches more Concept atoms.
     "type"            : i2b2 label (PROBLEM | TEST | TREATMENT)
     "start_char"      : offset within the section's text
     "end_char"        : offset within the section's text
   }
+
+`resolved_text` and `expanded_text` (article-stripped and abbrev-
+expanded forms) are NOT produced here -- they're derived by
+normalize_section_entities.py. Splitting keeps Stanza NER (~91s on L4
+GPU / ~16 min on CPU) idempotent; all text-level rules can be iterated
+on cheaply in the normalization step without re-running NER.
 
 Parallelism: doc paths are split into `--workers` equal shards and
 handed to a `multiprocessing.Pool`. The pool's initializer loads
@@ -45,7 +43,7 @@ Prereqs:
     nvidia/cudnn/lib + nvidia/cublas/lib so torch's bundled libs win.
 
 Usage:
-  python python/ingestion/mtsamples/extract_section_entities.py [--workers 8] [--batch 16] [--cpu]
+  python python/ingestion/mtsamples/extract_section_entities.py [--workers 8] [--batch 64] [--cpu]
 """
 
 from __future__ import annotations
@@ -54,7 +52,6 @@ import argparse
 import json
 import multiprocessing as mp
 import os
-import re
 import time
 import uuid
 from pathlib import Path
@@ -62,46 +59,25 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent.parent.parent
 DOCS_DIR = REPO / "data" / "mtsamples_docs"
 
-TOKEN_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9-]*\b")
-
 # Set in each worker by _init_worker(); reused across every pool task on
 # that worker so Stanza's pipeline loads exactly once per process.
 _NLP = None
 _WID = None
 
 
-def resolve_with_abbrevs(text: str, abbrev_upper: dict[str, str]) -> str:
-    if not abbrev_upper:
-        return text
-
-    def repl(m: re.Match) -> str:
-        tok = m.group(0)
-        return abbrev_upper.get(tok.upper(), tok)
-
-    return TOKEN_RE.sub(repl, text)
-
-
-def entities_from_stanza_doc(
-    sdoc,
-    section_text: str,
-    abbrev_upper: dict[str, str],
-) -> list[dict]:
-    out: list[dict] = []
-    for ent in sdoc.entities:
-        recognized = ent.text
-        surface = section_text[ent.start_char : ent.end_char]
-        resolved = (
-            resolve_with_abbrevs(recognized, abbrev_upper) if abbrev_upper else recognized
-        )
-        out.append({
-            "surface_text": surface,
-            "recognized_text": recognized,
-            "resolved_text": resolved,
+def entities_from_stanza_doc(sdoc, section_text: str) -> list[dict]:
+    """Build raw NER entity records. Text-level normalization (article
+    stripping, abbrev expansion) is deferred to normalize_section_entities.py."""
+    return [
+        {
+            "surface_text": section_text[ent.start_char : ent.end_char],
+            "recognized_text": ent.text,
             "type": ent.type,
             "start_char": ent.start_char,
             "end_char": ent.end_char,
-        })
-    return out
+        }
+        for ent in sdoc.entities
+    ]
 
 
 def _init_worker(use_gpu: bool) -> None:
@@ -134,7 +110,7 @@ def _process_shard(args: tuple) -> dict:
     shard_paths, batch_size = args
     paths = [Path(p) for p in shard_paths]
     if not paths:
-        return {"wid": _WID, "docs": 0, "ents": 0, "resolved_diff": 0, "elapsed_s": 0.0}
+        return {"wid": _WID, "docs": 0, "ents": 0, "elapsed_s": 0.0}
 
     docs = [(p, json.loads(p.read_text(encoding="utf-8"))) for p in paths]
     items: list[tuple[int, int, str]] = []
@@ -161,7 +137,6 @@ def _process_shard(args: tuple) -> dict:
           flush=True)
 
     total_ents = 0
-    n_resolved_diff = 0
     t0 = time.time()
     for bi in range(0, len(items), batch_size):
         chunk = items[bi : bi + batch_size]
@@ -169,12 +144,7 @@ def _process_shard(args: tuple) -> dict:
         _NLP.bulk_process(stanza_docs)
 
         for (di, si, section_text), sdoc in zip(chunk, stanza_docs):
-            abbrev_map = docs[di][1].get("abbreviations") or {}
-            abbrev_upper = {k.upper(): v for k, v in abbrev_map.items()}
-            ents = entities_from_stanza_doc(sdoc, section_text, abbrev_upper)
-            n_resolved_diff += sum(
-                1 for e in ents if e["resolved_text"] != e["recognized_text"]
-            )
+            ents = entities_from_stanza_doc(sdoc, section_text)
             docs[di][1]["sections"][si]["entities"] = ents
             total_ents += len(ents)
 
@@ -188,14 +158,13 @@ def _process_shard(args: tuple) -> dict:
         p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
 
     elapsed = time.time() - t0
-    print(f"[worker {_WID}] done: {len(paths)} docs, {total_ents} ents, "
-          f"{n_resolved_diff} resolved_diff in {elapsed:.1f}s",
+    print(f"[worker {_WID}] done: {len(paths)} docs, {total_ents} ents "
+          f"in {elapsed:.1f}s",
           flush=True)
     return {
         "wid": _WID,
         "docs": len(paths),
         "ents": total_ents,
-        "resolved_diff": n_resolved_diff,
         "elapsed_s": elapsed,
     }
 
@@ -241,12 +210,12 @@ def main() -> None:
                     help="multiprocessing worker count. Tuned via sweep on L4: "
                          "8 is optimal; 6 within 2s of best, >=12 regress as CUDA "
                          "context-switching eats the marginal parallelism, 32 OOMs")
-    ap.add_argument("--batch", type=int, default=16,
+    ap.add_argument("--batch", type=int, default=64,
                     help="sections per Stanza bulk_process batch (per worker). "
-                         "Tiny batches look pathological but within-shard length-"
-                         "bucketing means padding is near-zero, so 16/64/1024 are "
-                         "within 2s of each other; 16 wins by a hair and keeps "
-                         "activation memory lowest for the high-worker case")
+                         "Tuned via sweep: 32/64/128 share a flat bottom at ~91s "
+                         "on L4; 8 pays 17s in dispatch overhead, 512 pays 2s as "
+                         "the longest-first batch gets too large. 64 is the U-curve "
+                         "minimum with headroom for bigger worker counts.")
     ap.add_argument("--cpu", action="store_true",
                     help="force CPU (default: use GPU if available)")
     args = ap.parse_args()
@@ -280,7 +249,7 @@ def main() -> None:
             [(shard, args.batch) for shard in shards],
         )
 
-    total = {"docs": 0, "ents": 0, "resolved_diff": 0}
+    total = {"docs": 0, "ents": 0}
     for r in results:
         for k in total:
             total[k] += r.get(k, 0)
@@ -289,9 +258,10 @@ def main() -> None:
     per_worker = sorted([r.get("elapsed_s", 0.0) for r in results])
     print(
         f"done: {total['ents']:,} entities across {total['docs']:,} docs "
-        f"({total['resolved_diff']:,} with resolved_text != recognized_text) "
         f"in {wall:.1f}s wall  "
-        f"[per-worker work {min(per_worker):.1f}..{max(per_worker):.1f}s]",
+        f"[per-worker work {min(per_worker):.1f}..{max(per_worker):.1f}s]  "
+        f"(run normalize_section_entities.py next to derive "
+        f"resolved_text/expanded_text)",
         flush=True,
     )
 
