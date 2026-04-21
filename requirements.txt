@@ -7,3 +7,4 @@ dask
 requests
 transformers
 stanza
+abbreviations

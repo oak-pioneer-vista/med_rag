@@ -24,8 +24,21 @@ CREATE CONSTRAINT semtype_tui_unique IF NOT EXISTS FOR (s:SemanticType) REQUIRE 
 CREATE CONSTRAINT source_sab_unique  IF NOT EXISTS FOR (s:Source) REQUIRE s.sab IS UNIQUE;
 CREATE INDEX concept_name IF NOT EXISTS FOR (c:Concept) ON (c.name);
 CREATE INDEX atom_sab_code IF NOT EXISTS FOR (a:Atom) ON (a.sab, a.code);
+CREATE INDEX atom_str_norm IF NOT EXISTS FOR (a:Atom) ON (a.str_norm);
 CREATE FULLTEXT INDEX concept_name_fts IF NOT EXISTS FOR (c:Concept) ON EACH [c.name];
 CREATE FULLTEXT INDEX atom_str_fts IF NOT EXISTS FOR (a:Atom) ON EACH [a.str];
+CYPHER
+
+echo "==> backfilling Atom.str_norm (lowercased a.str) for exact case-insensitive lookup"
+# Idempotent: only touches atoms that haven't been normalized yet, so reruns
+# after an import that added new atoms stay cheap. `toLower` alone (no trim)
+# keeps the key stable with how callers will normalize their inputs; the
+# atom_str_norm range index above turns `MATCH (a:Atom {str_norm:'copd'})`
+# into a property lookup instead of the label scan that `toLower(a.str)=...`
+# would otherwise force.
+docker exec -i "$CONTAINER" cypher-shell -u neo4j -p "$NEO4J_PASSWORD" <<'CYPHER'
+MATCH (a:Atom) WHERE a.str_norm IS NULL AND a.str IS NOT NULL
+CALL { WITH a SET a.str_norm = toLower(a.str) } IN TRANSACTIONS OF 50000 ROWS;
 CYPHER
 
 echo "==> applying tier labels (ClinicalCore / ClinicalSupport / ClinicalDiscipline / Peripheral)"
