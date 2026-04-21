@@ -39,10 +39,10 @@ pip install -r requirements.txt
 
 ```bash
 # MTSamples medical transcriptions -> data/kaggle/mtsamples.csv (~16 MB)
-python python/ingestion/download_mtsamples.py
+python python/ingestion/mtsamples/download_mtsamples.py
 
 # UMLS 2025AB Metathesaurus Full -> data/umls/umls-2025AB-metathesaurus-full.zip (~5.3 GB)
-python python/ingestion/download_umls.py
+python python/ingestion/umls/download_umls.py
 ```
 
 Both pull from `gs://med_rag/datasets/`.
@@ -68,7 +68,7 @@ python python/neo4j_smoke_test.py
 ### 3. Ingest into Qdrant
 
 ```bash
-python python/ingestion/ingest_mtsamples.py
+python python/ingestion/mtsamples/ingest_mtsamples.py
 ```
 
 Embeds medical transcriptions using `all-MiniLM-L6-v2` and upserts them into a `mtsamples` Qdrant collection with metadata (specialty, description, keywords).
@@ -99,7 +99,7 @@ Row counts for UMLS 2025AB after `--english-only --drop-suppressed` (raw RRF →
 | MRDEF.RRF | 479,151 | `concept_definition.csv` | 464,510 |
 | MRSAB.RRF | 197 | `sources.csv` | 192 |
 
-Imported into Neo4j: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO row, carrying source code/TTY/string), and ~93.7M relationships (`HAS_ATOM`, `IS_A`, `RELATES`, `HAS_SEMTYPE`, `DEFINED_BY`) plus `SemanticType` and `Source` nodes. See the docstring in `python/ingestion/umls_to_neo4j_csv.py` for the graph model.
+Imported into Neo4j: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO row, carrying source code/TTY/string), and ~93.7M relationships (`HAS_ATOM`, `IS_A`, `RELATES`, `HAS_SEMTYPE`, `DEFINED_BY`) plus `SemanticType` and `Source` nodes. See the docstring in `python/ingestion/umls/umls_to_neo4j_csv.py` for the graph model.
 
 `load_neo4j.sh` invokes `scripts/create_neo4j_indices.sh` at the end — that's where the constraints/indexes/full-text indexes live and where the four semantic-type-derived labels below get applied to Concept nodes for query routing:
 
@@ -110,27 +110,43 @@ Imported into Neo4j: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO ro
 
 A pre-built snapshot of the imported store is at `gs://med_rag/neo4j_processed/neo4j_data.tar.zst` (~900 MB) — restore by extracting into the `med_rag_neo4j_data` Docker volume with neo4j stopped.
 
-### 5. Parse MTSamples into per-doc JSON
+### 5. Clean MTSamples (drop empty transcripts, dedupe cross-filings)
 
-Splits each transcription on ALL-CAPS `HEADING:` tokens and emits one `MTSampleDoc` JSON per row (one file per source row) into `data/mtsamples_docs/`. These intermediates are what the embedding step in `python/ingestion/embed_sections.py` consumes.
+```bash
+python python/ingestion/mtsamples/clean_mtsamples.py
+```
+
+MTSamples cross-files the same note under multiple `medical_specialty` tags with byte-identical `transcription`. This step drops rows with no transcription, collapses duplicate transcriptions (keeping first-row metadata, recording dropped specialty names in `alt_specialties`, and unioning keyword tokens), and writes the survivors to `data/mtsamples_clean.jsonl`. Expected: **4,966 raw rows → 2,357 cleaned records** (2,150 clusters collapsed, 2,609 dupe rows dropped).
+
+### 6. Parse MTSamples into per-doc JSON
+
+Splits each cleaned transcription on ALL-CAPS `HEADING:` tokens and emits one `MTSampleDoc` JSON per row into `data/mtsamples_docs/`. These intermediates are what the embedding step in `python/ingestion/mtsamples/embed_sections.py` consumes.
 
 ```bash
 # Build the heading allowlist from the raw CSV (1,803 headings, filtered by MIN_DOCS/MAX_WORDS).
-python python/ingestion/extract_mt_headings.py
+python python/ingestion/mtsamples/extract_mt_headings.py
 
 # Fan out per-row parse across dask workers (default 16). ~few seconds on 32 cores.
-python python/ingestion/parse_mtsamples.py [--workers 16]
+python python/ingestion/mtsamples/parse_mtsamples.py [--workers 16]
 ```
 
-Result: **2,357 per-doc JSONs** under `data/mtsamples_docs/{doc_id:04d}.json`. The parser dedupes byte-identical transcriptions before writing (4,966 raw rows collapse to 2,357 distinct notes — MTSamples cross-files the same note under multiple `medical_specialty` tags). Each doc carries `doc_id`, `specialty`, `specialty_cui`, `doctype_cui` (explicit mapping or heuristic rule), `sample_name`, merged `keywords`, `alt_specialties` (list of `{specialty, specialty_cui, doctype_cui}` from the dropped cross-filings — every entry has at least one CUI populated), and a list of `Section` records (`chunk_id`, `section_type`, `text`, plus placeholders for `embedding` and `entities` populated downstream). `doctype_cui` is set on 1,634/2,357 docs (specialties without an explicit mapping in `data/doctype_cui.json` and no matching heading rule get `""`).
+Result: **2,357 per-doc JSONs** under `data/mtsamples_docs/{doc_id:04d}.json`. Each doc carries `doc_id`, `specialty`, `specialty_cui`, `doctype_cui` (explicit mapping or heuristic rule), `sample_name`, merged `keywords`, `alt_specialties` (list of `{specialty, specialty_cui, doctype_cui}` from the dropped cross-filings — every entry has at least one CUI populated), and a list of `Section` records (`chunk_id`, `section_type`, `text`, plus placeholders for `embedding` and `entities` populated downstream). `doctype_cui` is set on 1,634/2,357 docs (specialties without an explicit mapping in `data/doctype_cui.json` and no matching heading rule get `""`).
 
-### 6. Embed section text into Qdrant
+### 7. Build per-doc abbreviation maps (Schwartz-Hearst)
+
+```bash
+python python/ingestion/mtsamples/build_abbreviations.py
+```
+
+Runs the Schwartz-Hearst algorithm on each doc's joined section texts to recover `{abbrev: long_form}` pairs (e.g. `"ORIF" -> "Open reduction and internal fixation"`, `"TLIF" -> "Transforaminal Lumbar Interbody Fusion"`), and writes the map back into the same per-doc JSON under a new top-level `abbreviations` field. Sections are joined with `" . "` so S-H's line-wise scan terminates at section boundaries, and the join is necessary because S-H's introduction ("long form (ABBR)") and later mentions often sit in different sections. Expected yield on MTSamples: **79/2,357 docs** with ≥1 pair, **143 total pairs** — hit rate is modest because most clinical abbreviations (CHF, COPD, HTN, …) are never introduced parenthetically in these notes.
+
+### 8. Embed section text into Qdrant
 
 Windows each `Section` into sentence packs of ≤200 tokens with 10% overlap, embeds every window by POSTing batches of up to 64 texts to the MedTE TEI service on `localhost:8080`, and upserts the vectors into the `mtsamples_sections` Qdrant collection. Parallelism is via `dask.bag.map_partitions` — each of the default 16 worker processes owns its own HTTP session and local tokenizer (used only for counting tokens during packing; the GPU-resident TEI container does all the encoding).
 
 ```bash
 # Requires qdrant + medte services from `docker compose up -d`.
-python python/ingestion/embed_sections.py [--workers 16] [--recreate]
+python python/ingestion/mtsamples/embed_sections.py [--workers 16] [--recreate]
 ```
 
 Point ids are `uuid5(chunk_id)` so re-runs are idempotent. Each Qdrant point's payload carries `chunk_id`, `parent_chunk_id`, `window_index`/`window_count`, `doc_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `alt_specialties`, `doctype_cui`, `sample_name`, `keywords`, and the windowed `text`. Collection dim and distance (cosine) are inferred from TEI's `/embed` response on startup. The collection is created with `optimizers.indexing_threshold=100` — Qdrant's default (~20k per segment) would otherwise leave every segment unindexed at this scale, falling back to brute-force search on every query. End state after a full run: 2,357 docs → **22,824** section-window points (768-d cosine).
@@ -146,7 +162,7 @@ Instruction-style query `"Retrieve all patients diagnosed with Lymphoblastic Leu
 
 Takeaways: (1) MedTE + mean pooling retrieves a clinically coherent oncology neighborhood (leukemia → related heme/onc consults → chemo access devices). (2) Instruction-style query phrasing and the family-history-vs-index-case distinction both trip the encoder — the top hit being a family-history surface match is expected bi-encoder behavior; a reranker (cross-encoder) or an instruction-tuned embedder (`intfloat/e5-*`, BGE) would be needed to fix it. (3) Post-dedupe the top-k now surfaces genuinely distinct clinical neighbors instead of near-identical cross-filings — compare to the pre-dedupe run where the target doc occupied ~half of the top-50 as four cross-filed copies.
 
-### 7. Create Qdrant payload indexes
+### 9. Create Qdrant payload indexes
 
 ```bash
 python scripts/create_qdrant_indices.py
@@ -159,7 +175,7 @@ Idempotent. Ensures `indexing_threshold=100` (matches what `embed_sections.py` s
 
 Without these, filters like `doc_id == 2306` or `specialty == "Nephrology"` are O(n) scans over 22K payloads on every query. Re-run whenever a new filterable field is introduced; existing indexes are a no-op.
 
-### 8. Create Neo4j constraints, indexes, and tier labels
+### 10. Create Neo4j constraints, indexes, and tier labels
 
 ```bash
 bash scripts/create_neo4j_indices.sh

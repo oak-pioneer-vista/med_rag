@@ -1,5 +1,5 @@
 {
-  "_comment": "Doctype CUI assignment for MTSamples docs. Two layers: (a) explicit_by_specialty maps the 8 MTSamples medical_specialty values that are actually document categories (not specialties) directly to their UMLS doctype CUI. (b) rules fire in order over the doc's section headings when specialty_cui is set but doctype_cui is not; first rule whose any_of overlap with the doc's section_types by >= min_hits wins. See python/ingestion/parse_mtsamples.py.",
+  "_comment": "Doctype CUI assignment for MTSamples docs. Two layers: (a) explicit_by_specialty maps the 8 MTSamples medical_specialty values that are actually document categories (not specialties) directly to their UMLS doctype CUI. (b) rules fire in order over the doc's section headings when specialty_cui is set but doctype_cui is not; first rule whose any_of overlap with the doc's section_types by >= min_hits wins. See python/ingestion/mtsamples/parse_mtsamples.py.",
   "explicit_by_specialty": {
     "Autopsy": "C1548372",
     "Consult - History and Phy.": "C1317420",

@@ -20,7 +20,7 @@ Graph model:
     (Concept)-[:DEFINED_BY {def}]->(Source)               # from MRDEF
 
 Usage:
-    python python/ingestion/umls_to_neo4j_csv.py \\
+    python python/ingestion/umls/umls_to_neo4j_csv.py \\
         --meta data/datasets/umls-2025AB-metathesaurus-full1/2025AB/META \\
         --out  data/neo4j_import \\
         --english-only --drop-suppressed [--workers N]

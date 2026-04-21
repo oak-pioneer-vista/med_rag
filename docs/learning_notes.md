@@ -53,7 +53,7 @@ Against a verbatim sentence copied from a source document, the same encoder peak
 
 ## Chunking: sentence-packed windows, 200 tokens, 10% overlap
 
-**Strategy.** Each section is split into sentences, then greedily packed into windows of up to **200 tokens** (MedTE tokenizer, excluding specials), with ~**10% overlap** (20 tokens ≈ one trailing sentence) carried into the next window. See `_pack_sentences` in `python/ingestion/embed_sections.py`.
+**Strategy.** Each section is split into sentences, then greedily packed into windows of up to **200 tokens** (MedTE tokenizer, excluding specials), with ~**10% overlap** (20 tokens ≈ one trailing sentence) carried into the next window. See `_pack_sentences` in `python/ingestion/mtsamples/embed_sections.py`.
 
 **Why sentence-aligned.** Splitting on sentence boundaries keeps each chunk semantically coherent, which matters for a sentence-trained encoder (see note above) — the alternative, fixed-length subword windows, routinely cuts mid-phrase and degrades embedding quality. Packing *multiple* sentences per window (vs. one-sentence-per-chunk) gives the encoder enough context to disambiguate pronouns and short clinical phrases, while staying well inside MedTE's 512-token limit.
 

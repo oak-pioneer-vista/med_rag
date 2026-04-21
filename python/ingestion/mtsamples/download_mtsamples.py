@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 GCS_URI = "gs://med_rag/datasets/mtsamples.csv"
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "kaggle" / "mtsamples"
+DATA_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "kaggle" / "mtsamples"
 DEST = DATA_DIR / "mtsamples.csv"
 
 

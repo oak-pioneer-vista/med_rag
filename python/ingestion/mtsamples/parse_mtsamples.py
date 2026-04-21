@@ -1,4 +1,4 @@
-"""Parse MTSamples transcriptions into per-doc MTSampleDoc JSON files.
+"""Parse cleaned MTSamples records into per-doc MTSampleDoc JSON files.
 
 MTSamples encodes notes inline ("SUBJECTIVE:, ... MEDICATIONS: , ..."),
 so we carve each document on ALL-CAPS "HEADING:" tokens, keeping only
@@ -9,13 +9,15 @@ once per partition and writes one intermediate JSON doc under
 data/mtsamples_docs/ so downstream stages (embedding, NER, indexing)
 can fan out per file.
 
-`doc_id` matches the row position after dropna(transcription), so it lines
-up with the point ids in `ingest_mtsamples.py`.
+Input is the cleaned+deduped JSONL produced by clean_mtsamples.py;
+`doc_id` is the row position within that file, so it lines up with the
+point ids in `ingest_mtsamples.py`.
 
 Outputs:
   - data/mtsamples_docs/{doc_id:04d}.json  (one file per MTSampleDoc)
 
 Usage:
+  python python/ingestion/mtsamples/clean_mtsamples.py    # one-time prereq
   python python/ingestion/mtsamples/parse_mtsamples.py [--workers 16]
 """
 
@@ -27,10 +29,9 @@ from pathlib import Path
 from typing import Iterable
 
 import dask.bag as db
-import pandas as pd
 
-REPO = Path(__file__).resolve().parent.parent.parent
-SRC_CSV = REPO / "data" / "kaggle" / "mtsamples" / "mtsamples.csv"
+REPO = Path(__file__).resolve().parent.parent.parent.parent
+SRC_JSONL = REPO / "data" / "mtsamples_clean.jsonl"
 HEADINGS_FILE = REPO / "data" / "mt_section_headings.txt"
 SPECIALTY_CUI_FILE = REPO / "data" / "specialty_cui.json"
 DOCTYPE_CUI_FILE = REPO / "data" / "doctype_cui.json"
@@ -246,84 +247,18 @@ def _process_partition(partition: Iterable[tuple[int, dict]]) -> list[tuple]:
     ]
 
 
-def _merge_keyword_tokens(a: str, b: str) -> str:
-    """Union comma-split tokens from two keyword strings, case-insensitive dedupe.
-
-    MTSamples keyword strings in a dupe cluster typically differ only by a
-    leading specialty token (e.g. "surgery, ..." vs "gastroenterology, ...")
-    on otherwise identical content -- union keeps the cross-filing tokens
-    without duplicating the clinical vocabulary.
-    """
-    seen: dict[str, str] = {}
-    for part in a.split(",") + b.split(","):
-        tok = part.strip()
-        if not tok:
-            continue
-        key = tok.lower()
-        if key not in seen:
-            seen[key] = tok
-    return ", ".join(seen.values())
-
-
-def dedupe_by_transcription(df: pd.DataFrame) -> pd.DataFrame:
-    """Collapse byte-identical transcriptions across medical_specialty filings.
-
-    MTSamples ships the same note under multiple `medical_specialty` rows
-    (e.g. "Lumbar Discogram" filed under 5 specialties) with byte-identical
-    `transcription`. Embedding all copies wastes Qdrant points and pads top-k
-    with trivial dupes. Keep the first row's primary metadata, record dropped
-    rows' specialty names in `alt_specialties` (enriched to full CUI records
-    per-doc in `_process_one`), and union keyword tokens so downstream
-    specialty/keyword filters still match cross-filings.
-    """
-    first_idx: dict[str, int] = {}
-    alts_by_first: dict[int, list[str]] = {}
-    kw_by_first: dict[int, str] = {}
-    drop_idx: list[int] = []
-
-    for i, row in df.iterrows():
-        t = row["transcription"]
-        if t in first_idx:
-            fi = first_idx[t]
-            spec = str(row.get("medical_specialty") or "").strip()
-            alts_by_first.setdefault(fi, []).append(spec)
-            base_kw = kw_by_first.get(fi, str(df.at[fi, "keywords"] or "").strip())
-            kw_by_first[fi] = _merge_keyword_tokens(
-                base_kw, str(row.get("keywords") or "").strip()
-            )
-            drop_idx.append(int(i))
-        else:
-            first_idx[t] = int(i)
-
-    out = df.drop(index=drop_idx).reset_index(drop=True)
-
-    # Map (new row index in `out`) -> original-first index in `df`.
-    # `first_idx.values()` is ordered by first-occurrence, same order `drop`
-    # preserves, so enumerating `out` lines up 1:1 with sorted kept indices.
-    kept_sorted = sorted(first_idx.values())
-    for new_i, old_i in enumerate(kept_sorted):
-        if old_i in kw_by_first:
-            out.at[new_i, "keywords"] = kw_by_first[old_i]
-
-    alt_col: list[list[str]] = [alts_by_first.get(old_i, []) for old_i in kept_sorted]
-    out["alt_specialties"] = alt_col
-
-    n_clusters = len(alts_by_first)
-    n_dropped = len(drop_idx)
-    print(
-        f"dedupe: {len(df)} -> {len(out)} rows "
-        f"({n_clusters} clusters collapsed, {n_dropped} dupe rows dropped)"
-    )
-    return out
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--workers", type=int, default=16, help="dask worker processes")
     args = ap.parse_args()
 
+    if not SRC_JSONL.exists():
+        raise SystemExit(
+            f"missing {SRC_JSONL} -- run python/ingestion/mtsamples/clean_mtsamples.py first"
+        )
+
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    # doc_ids are assigned fresh each run from the post-dedupe row index, so
+    # doc_ids are assigned fresh each run from the cleaned-file row index, so
     # stale files from prior runs would leave a mix of old and new indices.
     stale = list(OUT_DIR.glob("*.json"))
     if stale:
@@ -331,10 +266,10 @@ def main() -> None:
             p.unlink()
         print(f"cleared {len(stale)} stale JSON files from {OUT_DIR}/")
 
-    df = pd.read_csv(SRC_CSV).dropna(subset=["transcription"]).fillna("").reset_index(drop=True)
-    df = dedupe_by_transcription(df)
+    with SRC_JSONL.open(encoding="utf-8") as f:
+        rows = [json.loads(line) for line in f if line.strip()]
 
-    tasks = [(int(i), row.to_dict()) for i, row in df.iterrows()]
+    tasks = [(i, row) for i, row in enumerate(rows)]
     print(f"dispatching {len(tasks)} records across {args.workers} dask partitions -> {OUT_DIR}/")
 
     bag = db.from_sequence(tasks, npartitions=args.workers)

@@ -1,5 +1,5 @@
 {
-  "_comment": "MTSamples medical_specialty -> UMLS CUI (:ClinicalDiscipline tier). Empty string means the category is a document/report type with no sensible specialty CUI. See python/ingestion/parse_mtsamples.py.",
+  "_comment": "MTSamples medical_specialty -> UMLS CUI (:ClinicalDiscipline tier). Empty string means the category is a document/report type with no sensible specialty CUI. See python/ingestion/mtsamples/parse_mtsamples.py.",
   "Allergy / Immunology": "C0002111",
   "Autopsy": "",
   "Bariatrics": "C1450026",

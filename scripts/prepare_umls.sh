@@ -14,7 +14,7 @@ META_DIR="$EXTRACT_DIR/2025AB/META"
 OUT_DIR="data/neo4j_import"
 
 if [[ ! -f "$ZIP" ]]; then
-    echo "missing $ZIP — run python/ingestion/download_umls.py first" >&2
+    echo "missing $ZIP — run python/ingestion/umls/download_umls.py first" >&2
     exit 1
 fi
 
@@ -27,7 +27,7 @@ else
 fi
 
 echo "==> converting RRF -> CSV (out=$OUT_DIR)"
-python3 python/ingestion/umls_to_neo4j_csv.py \
+python3 python/ingestion/umls/umls_to_neo4j_csv.py \
     --meta "$META_DIR" \
     --out  "$OUT_DIR" \
     --english-only --drop-suppressed

@@ -20,7 +20,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parent.parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent.parent
 SRC = REPO / "data" / "kaggle" / "mtsamples" / "mtsamples.csv"
 OUT = REPO / "data" / "mt_section_headings.txt"
 

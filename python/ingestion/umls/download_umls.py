@@ -5,7 +5,7 @@ Requires:
   - (`gcloud auth login` or a service account with storage.objects.get)
 
 Usage:
-  python python/ingestion/download_umls.py
+  python python/ingestion/umls/download_umls.py
 """
 
 import subprocess
@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 GCS_URI = "gs://med_rag/datasets/umls-2025AB-metathesaurus-full(1).zip"
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "umls"
+DATA_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "umls"
 DEST = DATA_DIR / "umls-2025AB-metathesaurus-full.zip"
 
 

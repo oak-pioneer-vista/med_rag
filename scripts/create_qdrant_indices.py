@@ -47,7 +47,7 @@ def main() -> None:
     if not client.collection_exists(COLLECTION):
         raise SystemExit(
             f"collection {COLLECTION!r} doesn't exist — "
-            f"run python/ingestion/embed_sections.py first"
+            f"run python/ingestion/mtsamples/embed_sections.py first"
         )
 
     print(f"==> setting indexing_threshold={INDEXING_THRESHOLD} on {COLLECTION}")

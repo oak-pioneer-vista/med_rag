@@ -16,7 +16,7 @@ Setup (one time -- models cache to ~/stanza_resources/):
     python -c "import stanza; stanza.download('en', package='mimic', processors={'ner':'i2b2'})"
 
 Usage:
-    python python/ingestion/extract_entities.py [--workers 4] [--out PATH] [--abbrev-out PATH]
+    python python/ingestion/mtsamples/extract_entities.py [--workers 4] [--out PATH] [--abbrev-out PATH]
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ from embed_sections import (
     _split_sentences,
 )
 
-REPO = Path(__file__).resolve().parent.parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent.parent
 OUT_DEFAULT = REPO / "data" / "entities" / "chunk_entities.jsonl"
 ABBREV_OUT_DEFAULT = REPO / "data" / "entities" / "doc_abbreviations.jsonl"
 

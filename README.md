@@ -4,7 +4,8 @@ Medical RAG (Retrieval-Augmented Generation) pipeline built on the MTSamples med
 
 ## What's in here
 
-- `python/ingestion/` — dataset downloaders, MTSamples parser, UMLS → Neo4j CSV converter, and the MedTE/TEI embedding pipeline.
+- `python/ingestion/mtsamples/` — MTSamples downloader, section parser, MedTE/TEI embedding pipeline, Stanza NER, and the Note/Section/Entity Neo4j loader.
+- `python/ingestion/umls/` — UMLS downloader and the RRF → Neo4j admin-import CSV converter.
 - `scripts/` — shell wrappers for the UMLS prepare + bulk-load steps.
 - `docker-compose.yml` — Qdrant, Neo4j, and the MedTE text-embeddings-inference (TEI) service on the host GPU.
 

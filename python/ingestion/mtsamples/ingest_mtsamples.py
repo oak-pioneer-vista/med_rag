@@ -14,7 +14,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
 
-DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "kaggle" / "mtsamples"
+DATA_DIR = Path(__file__).resolve().parent.parent.parent.parent / "data" / "kaggle" / "mtsamples"
 COLLECTION = "mtsamples"
 QDRANT_URL = "http://localhost:6333"
 EMBED_MODEL = "all-MiniLM-L6-v2"

@@ -34,7 +34,7 @@ from qdrant_client.models import (
 )
 from transformers import AutoTokenizer
 
-REPO = Path(__file__).resolve().parent.parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent.parent
 DOCS_DIR = REPO / "data" / "mtsamples_docs"
 
 MODEL_ID = "MohammadKhodadad/MedTE-cl15-step-8000"

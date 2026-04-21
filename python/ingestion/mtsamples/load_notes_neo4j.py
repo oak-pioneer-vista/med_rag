@@ -34,7 +34,7 @@ Prereqs:
   - extract_entities.py has produced data/entities/chunk_entities.jsonl
 
 Usage:
-    python python/ingestion/load_notes_neo4j.py \\
+    python python/ingestion/mtsamples/load_notes_neo4j.py \\
         [--entities PATH] [--uri bolt://localhost:7687] [--limit N]
 """
 
@@ -48,7 +48,7 @@ from typing import Iterable
 
 from neo4j import GraphDatabase
 
-REPO = Path(__file__).resolve().parent.parent.parent
+REPO = Path(__file__).resolve().parent.parent.parent.parent
 DOCS_DIR = REPO / "data" / "mtsamples_docs"
 ENTITIES_DEFAULT = REPO / "data" / "entities" / "chunk_entities.jsonl"
 

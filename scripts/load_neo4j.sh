@@ -3,7 +3,7 @@
 #
 # Prereqs:
 #   - docker compose up -d neo4j  (container defined, can be running or stopped)
-#   - data/neo4j_import/ populated by python/ingestion/umls_to_neo4j_csv.py
+#   - data/neo4j_import/ populated by python/ingestion/umls/umls_to_neo4j_csv.py
 #   - docker-compose.yml mounts ./data/neo4j_import -> /import in the neo4j service
 #
 # Runs `neo4j-admin database import full` against the 'neo4j' database,
@@ -31,7 +31,7 @@ required_files=(
 
 for f in "${required_files[@]}"; do
     if [[ ! -f "$IMPORT_DIR/$f" ]]; then
-        echo "missing $IMPORT_DIR/$f — run python/ingestion/umls_to_neo4j_csv.py first" >&2
+        echo "missing $IMPORT_DIR/$f — run python/ingestion/umls/umls_to_neo4j_csv.py first" >&2
         exit 1
     fi
 done
