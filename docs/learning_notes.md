@@ -159,6 +159,19 @@ Dropping the competing half of the query lifted peak score from 0.74 → 0.85 an
 
 **Takeaway.** Schwartz-Hearst and LRABR-style dictionary tagging solve disjoint halves of the abbreviation problem — parenthetical introductions vs. bare mentions. You need both, and on clinical text you also need a clinical-specific supplement because `LRABR` was assembled for PubMed, not discharge summaries.
 
+## TODO: lexical vs. semantic linking after entity resolution
+
+**Status.** Open question. Decide before wiring the post-resolution step.
+
+**Problem.** Once a mention is resolved to a CUI (see "Entity linking / grounding against UMLS in Neo4j"), the next stage — joining that CUI to other concepts, expansions, or passages — can be done lexically (graph traversal + fulltext over `Atom`/`Concept` strings) or semantically (cosine over CUI/concept embeddings). They have different failure modes and the right choice probably depends on the downstream consumer (retrieval expansion vs. graph reasoning vs. reranking).
+
+**To weigh.**
+- **Lexical (graph-side).** Deterministic, auditable, free once UMLS is loaded. Walks `IS_A` / `RELATES` / `HAS_ATOM` for synonym + hierarchy expansion. Misses cross-vocabulary semantic neighbors that aren't connected by an explicit edge.
+- **Semantic (embedding-side).** Embed each CUI's preferred name (or pooled atom strings) once, ANN-search over the concept space. Surfaces clinically related concepts the graph doesn't connect, but adds an embedding store, an encoder choice (MedTE? a dedicated concept encoder?), and the same short-input degradation noted at the top of this file — preferred names are 1–4 words.
+- **Hybrid.** Lexical for synonym + hierarchy (where the graph is authoritative), semantic for "concepts close in meaning but not directly connected." Most likely the answer, but needs an evaluation harness to decide where the boundary sits.
+
+**Decide alongside.** The linker design (above) and the negation TODO (below) — both interact with whether downstream consumers see surface strings, CUIs, or vectors.
+
 ## TODO: negation-aware embedding
 
 **Status.** Not currently implemented. Revisit and fix.
