@@ -124,9 +124,9 @@ python python/ingestion/mtsamples/parse_mtsamples.py [--workers 16]
 
 Result: **2,357 per-doc JSONs** under `data/mtsamples_docs/{doc_id:04d}.json`. Each doc carries `doc_id`, `specialty`, `specialty_cui`, `doctype_cui` (explicit mapping or heuristic rule), `sample_name`, merged `keywords`, `alt_specialties` (list of `{specialty, specialty_cui, doctype_cui}` from the dropped cross-filings — every entry has at least one CUI populated), and a list of `Section` records (`chunk_id`, `section_type`, `text`, plus placeholders for `embedding` and `entities` populated downstream). `doctype_cui` is set on 1,634/2,357 docs (specialties without an explicit mapping in `data/doctype_cui.json` and no matching heading rule get `""`).
 
-### 6. Build per-doc abbreviation maps (Schwartz-Hearst + override + LRABR + MedTE WSD)
+### 6. Build per-section abbreviation maps (Schwartz-Hearst + override + LRABR + MedTE WSD)
 
-Four-stage resolution with provenance tracking. Each doc gets `abbreviations`, `abbreviations_source` (`sh`/`override`/`lrabr`), and `abbreviations_score` (1.0 for S-H and override hits, cosine similarity for LRABR hits) written into its per-doc JSON.
+Three-stage resolution **per Section**, not per doc. Each Section gets `abbreviations`, `abbreviations_source` (`sh`/`override`/`lrabr`), and `abbreviations_score` (1.0 for S-H and override, cosine similarity for LRABR) written into the per-doc JSON. The same surface form can resolve to different expansions in different sections of the same doc — useful when one note mixes topics (e.g. `MS` could mean mitral stenosis in `PROCEDURE` and multiple sclerosis in `HPI` of the same doc; the section text is what disambiguates).
 
 ```bash
 # prereqs: MedTE TEI up, LRABR staged, parse_mtsamples already run
@@ -135,13 +135,13 @@ python python/ingestion/umls/download_specialist_lexicon.py
 python python/ingestion/mtsamples/build_abbreviations.py [--min-score 0.3]
 ```
 
-**1. Schwartz-Hearst** over joined section texts (`" . "` separator so the line-wise scan terminates at section boundaries). Highest confidence because the definition is evidence-in-doc.
+**1. Schwartz-Hearst** over each section's text alone. Most clinical notes introduce abbreviations once at the top and reuse them across sections, so per-section S-H gives many fewer hits than the per-doc variant — but the hits that remain are still the highest-confidence signal because the definition is evidence-in-section.
 
-**2. Curated clinical override** (`data/clinical_abbreviations_override.json`) — a ~60-entry hand-picked list for clinical-canon abbreviations (IV, BUN, CT, MRI, EKG, ABCD, AICD, PTT, PSA, …) whose canonical expansion is overwhelmingly unambiguous in clinical notes. Wins over LRABR; source tag `override`.
+**2. Curated clinical override** (`data/clinical_abbreviations_override.json`) — a ~60-entry hand-picked list for clinical-canon abbreviations (IV, BUN, CT, MRI, EKG, ABCD, AICD, PTT, PSA, …) whose canonical expansion is overwhelmingly unambiguous in clinical notes regardless of section context. Wins over LRABR; source tag `override`; no embedding check needed.
 
-**3. LRABR gazetteer + MedTE WSD** for everything else — NLM's SPECIALIST Lexicon LRABR (~62K abbrevs, ~38K with multiple senses) is purpose-built and far cleaner than deriving AB/ACR atoms from MRCONSO (which is dominated by chemo-protocol shorthand and gene symbols). Every LRABR hit is gated by cosine similarity between the doc context and each candidate expansion via MedTE/TEI; winner must clear `--min-score` (default 0.3). This drops the obscure-single-sense-LRABR cases (e.g. `AMSA → amphotericin in solid-state administration`) in docs where the clinical sense isn't in LRABR, rather than injecting them blindly.
+**3. LRABR gazetteer + MedTE WSD** for everything else — NLM's SPECIALIST Lexicon LRABR (~62K abbrevs, ~38K with multiple senses) is purpose-built and far cleaner than deriving AB/ACR atoms from MRCONSO (which is dominated by chemo-protocol shorthand and gene symbols). Every LRABR hit is gated by cosine similarity between **THIS SECTION's text** and each candidate expansion via MedTE/TEI; winner must clear `--min-score` (default 0.3). Per-section context is shorter than the joined-doc context, which is the point — when a doc spans multiple topics the WSD shouldn't average them.
 
-Expected yield on MTSamples: **~1,500/2,357 docs** (64%) with ≥1 pair. Typical run: **143 S-H, ~2,400 override, ~1,500 LRABR**; ~4,500 LRABR candidates skipped below threshold. Uniform threshold gate is load-bearing — without it, single-sense LRABR hits for `ABCD`/`AICD`/`PSA`/etc. would inject wrong-sense expansions in clinical docs.
+Resolution stats on MTSamples: **3,634/18,336 sections (~20%)** carry ≥1 abbreviation; **135 S-H + 2,799 override + 3,327 LRABR** per-section assignments; ~3,861 LRABR candidates skipped below threshold. Embedding pass is small (~3,700 unique section contexts + ~14,400 unique expansions, ~8s on the local TEI service). Compared to the previous per-doc design (1,500 docs / 2,357 with ≥1 abbrev; 143 S-H, 2,392 override, 1,542 LRABR): S-H is ~unchanged (most parenthetical intros sit in the same section as their abbrev), override and LRABR roughly double because the dedup key is now per-section instead of per-doc — the same `IV` or `CT` appearing in three sections of one doc now resolves three times, with WSD scored against each section's local context.
 
 ### 7. Extract per-section entities with spans (Stanza i2b2 NER)
 

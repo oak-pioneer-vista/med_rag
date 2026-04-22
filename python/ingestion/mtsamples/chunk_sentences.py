@@ -12,6 +12,11 @@ entities contribute their identifiers to three per-sentence sets.
 Output is written back into each Section as a new `sentences` list:
 
   {
+    "chunk_id"     : stable sentence-level id "{section_chunk_id}:s{idx}",
+                     e.g. "1003:procedure:s5". This is the join key used
+                     by Neo4j (and any other downstream store) that wants
+                     to address individual sentences independent of their
+                     positional index.
     "text"         : sentence text,
     "cuis"         : sorted list of UMLS CUIs in this sentence,
     "tuis"         : sorted list of semantic TUIs in this sentence,
@@ -87,7 +92,12 @@ def compile_surface_pattern(surfaces: list[str]) -> re.Pattern | None:
     )
 
 
-def annotate_sentence(sent_text: str, idx: dict, pattern: re.Pattern | None) -> dict:
+def annotate_sentence(
+    sent_text: str,
+    idx: dict,
+    pattern: re.Pattern | None,
+    chunk_id: str,
+) -> dict:
     cuis: set[str] = set()
     tuis: set[str] = set()
     surfaces: set[str] = set()
@@ -101,6 +111,7 @@ def annotate_sentence(sent_text: str, idx: dict, pattern: re.Pattern | None) -> 
                 tuis.update(tui_tuple)
                 surfaces.add(surface_lower)
     return {
+        "chunk_id": chunk_id,
         "text": sent_text,
         "cuis": sorted(cuis),
         "tuis": sorted(tuis),
@@ -182,17 +193,22 @@ def _process_shard(args: tuple) -> dict:
         _NLP.bulk_process(stanza_docs)
         for (di, si, _), sdoc in zip(chunk, stanza_docs):
             idx, pat = doc_indices[di]
+            section = docs[di][1]["sections"][si]
+            section_chunk_id = section.get("chunk_id", "")
             sents_out: list[dict] = []
+            sent_idx = 0
             for sent in sdoc.sentences:
                 text = sent.text.strip() if sent.text else ""
                 if not text:
                     continue
-                rec = annotate_sentence(text, idx, pat)
+                chunk_id = f"{section_chunk_id}:s{sent_idx}"
+                rec = annotate_sentence(text, idx, pat, chunk_id)
                 sents_out.append(rec)
+                sent_idx += 1
                 n_sentences += 1
                 if rec["cuis"]:
                     n_sentences_hit += 1
-            docs[di][1]["sections"][si]["sentences"] = sents_out
+            section["sentences"] = sents_out
 
     for p, d in docs:
         p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")

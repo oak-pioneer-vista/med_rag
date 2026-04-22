@@ -1,163 +1,65 @@
-"""Materialize MTSamples notes, sections, and entity mentions as a Neo4j graph.
+"""Materialize MTSamples notes, sections, entities as Neo4j nodes on top of UMLS.
 
-Target shape (Atom + Concept come from the UMLS import; this script only
-adds the clinical-note layer on top):
+Reads the per-doc JSONs at data/mtsamples_docs/*.json (written by the
+full mtsamples pipeline: parse -> abbreviations -> extract_section_entities
+-> normalize -> link_* -> chunk_sentences) and materializes the
+clinical-note layer of the graph so it can be queried alongside the
+pre-loaded UMLS Concepts/Atoms/SemanticTypes.
+
+Graph shape (UMLS nodes are pre-existing):
 
     (:Note {doc_id, sample_name, specialty, doctype_cui})
-        -[:IN_SPECIALTY]-> (:Concept {cui})                   -- specialty_cui
-        -[:HAS_SECTION]-> (:Section {chunk_id, section_type})
+        -[:IN_SPECIALTY]-> (:Concept {cui})            -- specialty_cui
+        -[:IN_ALT_SPECIALTY]-> (:Concept {cui})        -- each alt_specialties[i]
+        -[:HAS_SECTION]-> (:Section {chunk_id, section_type, doc_id})
                               -[:OF_TYPE]-> (:Concept {cui})  -- section_cui
                               -[:HAS_MENTION {start_char, end_char,
-                                              raw_text, expanded}]->
-                          (:Entity {text, type})
-                              -[:LINKS_TO]-> (:Atom {str_norm})
+                                              surface_text, recognized_text,
+                                              resolved_text, expanded_text,
+                                              type, cui_match}]->
+                          (:Entity {entity_hash, text, type})
+                              -[:REFERS_TO]-> (:Concept {cui})  -- entity's resolved cui
 
-`Entity.text` is the canonical, *expansion-resolved* form. When the Stanza
-extraction step recorded an `expansions` dict on a mention, each abbreviation
-token is substituted with its S-H long form before the lookup, so a mention
-like "CHF exacerbation" becomes Entity `text = "congestive heart failure
-exacerbation"` and its str_norm probe goes against the UMLS Atom index with
-the expanded string. Mentions whose canonical form has no Atom hit still
-materialize an :Entity node but without a `:LINKS_TO` edge -- the graph
-keeps coverage gaps visible instead of silently dropping them.
-
-The Stanza output is emitted per Qdrant-aligned window (chunk_id ending in
-`#<n>` for multi-window sections). This loader re-groups by
-`parent_chunk_id` so a Section is the graph-level unit; window-level
-:Section nodes would not round-trip back to the section-local `section_cui`
-from the parse step.
+Parallelism: dask.bag.map_partitions, N workers (each with its own
+Neo4j session). Each worker shards its docs and runs an UNWIND-style
+upsert per doc.
 
 Prereqs:
-  - UMLS Neo4j loaded (scripts/load_neo4j.sh)
-  - scripts/create_neo4j_indices.sh run (so atom_str_norm is populated and
-    note/section/entity constraints exist)
-  - extract_entities.py has produced data/entities/chunk_entities.jsonl
+  - UMLS Neo4j loaded (scripts/load_neo4j.sh) -- :Concept, :Atom,
+    :SemanticType must exist.
+  - data/mtsamples_docs/*.json populated by the pipeline through step
+    12 (link_entities_to_cui.py) at minimum. Step 13 (chunk_sentences)
+    is optional; this loader only needs doc-level metadata, sections,
+    and section-level entities.
 
 Usage:
-    python python/ingestion/mtsamples/load_notes_neo4j.py \\
-        [--entities PATH] [--uri bolt://localhost:7687] [--limit N]
+  python python/ingestion/mtsamples/load_notes_neo4j.py [--workers 8] [--drop]
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
+import multiprocessing as mp
+import os
+import time
+import uuid
 from pathlib import Path
-from typing import Iterable
 
 from neo4j import GraphDatabase
 
 REPO = Path(__file__).resolve().parent.parent.parent.parent
 DOCS_DIR = REPO / "data" / "mtsamples_docs"
-ENTITIES_DEFAULT = REPO / "data" / "entities" / "chunk_entities.jsonl"
 
-NEO4J_URI = "bolt://localhost:7687"
-NEO4J_AUTH = ("neo4j", "medragpass")
-
-
-def _apply_expansions(text: str, expansions: dict[str, str] | None) -> str:
-    """Replace each abbreviation token in `text` with its long form.
-
-    Whole-word boundary so "CT" in "CT scan" expands but "ct" inside
-    "fact" stays put. re.escape handles S-H keys that include punctuation
-    ("HbA1c", "T-cell" if ever produced).
-    """
-    if not expansions:
-        return text
-    out = text
-    for tok, long_form in expansions.items():
-        out = re.sub(rf"\b{re.escape(tok)}\b", long_form, out)
-    return out
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = os.environ.get("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "medragpass")
 
 
-def _norm_for_atom(text: str) -> str:
-    """Mirror the normalization applied to Atom.str_norm in the UMLS graph.
-
-    create_neo4j_indices.sh sets `a.str_norm = toLower(a.str)`, so an index
-    lookup needs the lookup key normalized the same way. Strip surrounding
-    whitespace and lowercase; anything more aggressive (e.g. punctuation
-    collapse) would drift from the Atom keys and silently miss.
-    """
-    return text.strip().lower()
-
-
-def _load_doc_meta(doc_id: int) -> dict:
-    """Load the parsed doc JSON for section_cui + specialty_cui lookups."""
-    # parse_mtsamples wrote files with zero-padded ids; mirror the padding.
-    path = DOCS_DIR / f"{int(doc_id):04d}.json"
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _iter_entity_records(path: Path) -> Iterable[dict]:
-    with path.open(encoding="utf-8") as f:
-        for line in f:
-            yield json.loads(line)
-
-
-def _build_doc_payload(doc_id: int, records: list[dict]) -> dict:
-    """Shape one UPSERT_CYPHER payload from all window records of a doc.
-
-    Groups mentions by parent_chunk_id (= Section). Deduplicates within a
-    section by (raw_text, type, start_char, end_char) so identical rows
-    from overlapping windows don't land as duplicate HAS_MENTION edges;
-    offsets that differ across overlap windows still produce separate
-    edges because they're window-relative. TODO: promote section-relative
-    offsets in extract_entities output for exact cross-window dedupe.
-    """
-    doc_meta = _load_doc_meta(doc_id)
-    section_cui_by_chunk = {
-        s["chunk_id"]: (s.get("section_cui") or "")
-        for s in doc_meta.get("sections", [])
-    }
-
-    note = {
-        "doc_id": int(doc_id),
-        "sample_name": doc_meta.get("sample_name", "") or "",
-        "specialty": doc_meta.get("specialty", "") or "",
-        "specialty_cui": doc_meta.get("specialty_cui", "") or "",
-        "doctype_cui": doc_meta.get("doctype_cui", "") or "",
-    }
-
-    sections: dict[str, dict] = {}
-    seen: set[tuple] = set()
-    for r in records:
-        sec_id = r["parent_chunk_id"]
-        sec = sections.setdefault(
-            sec_id,
-            {
-                "chunk_id": sec_id,
-                "section_type": r.get("section_type", "") or "",
-                "section_cui": section_cui_by_chunk.get(sec_id, "") or "",
-                "mentions": [],
-            },
-        )
-        for e in r.get("entities", []):
-            key = (sec_id, e["text"], e["type"], e["start_char"], e["end_char"])
-            if key in seen:
-                continue
-            seen.add(key)
-            expansions = e.get("expansions") or {}
-            canonical = _apply_expansions(e["text"], expansions)
-            sec["mentions"].append({
-                "raw_text": e["text"],
-                "canonical_text": canonical,
-                "type": e["type"],
-                "start_char": int(e["start_char"]),
-                "end_char": int(e["end_char"]),
-                "str_norm": _norm_for_atom(canonical),
-                "expanded": bool(expansions),
-            })
-
-    return {"note": note, "sections": list(sections.values())}
-
-
-# One Cypher per doc: MERGE the Note + its specialty link, then UNWIND
-# sections (Section + OF_TYPE), then UNWIND mentions (Entity + HAS_MENTION
-# + optional LINKS_TO). Subqueries guard on empty cui/str_norm so missing
-# metadata or out-of-vocabulary mentions skip their link without exploding
-# the Entity count with empty-key merges.
+# One upsert per doc. Subqueries guard every Concept merge on non-empty
+# CUI so we never create empty-key Concept nodes alongside the real UMLS
+# ones. HAS_MENTION uses (start_char, end_char) to dedupe re-runs --
+# identical spans within a section collapse onto a single edge.
 UPSERT_CYPHER = """
 MERGE (n:Note {doc_id: $note.doc_id})
 SET n.sample_name = $note.sample_name,
@@ -169,6 +71,14 @@ CALL {
     WITH n WHERE $note.specialty_cui <> ''
     MERGE (sc:Concept {cui: $note.specialty_cui})
     MERGE (n)-[:IN_SPECIALTY]->(sc)
+}
+WITH n
+CALL {
+    WITH n
+    UNWIND $note.alt_cuis AS alt_cui
+    WITH n, alt_cui WHERE alt_cui <> ''
+    MERGE (ac:Concept {cui: alt_cui})
+    MERGE (n)-[:IN_ALT_SPECIALTY]->(ac)
 }
 WITH n
 UNWIND $sections AS sec
@@ -184,75 +94,232 @@ UNWIND $sections AS sec
         MERGE (s)-[:OF_TYPE]->(tc)
     }
     WITH s, sec
-    UNWIND sec.mentions AS m
-        MERGE (e:Entity {text: m.canonical_text, type: m.type})
+    UNWIND sec.entities AS m
+        MERGE (e:Entity {entity_hash: m.entity_hash})
+        SET e.text = m.resolved_text,
+            e.type = m.type
         MERGE (s)-[hm:HAS_MENTION {start_char: m.start_char,
                                     end_char:   m.end_char}]->(e)
-        SET hm.raw_text = m.raw_text,
-            hm.expanded = m.expanded
+        SET hm.surface_text    = m.surface_text,
+            hm.recognized_text = m.recognized_text,
+            hm.resolved_text   = m.resolved_text,
+            hm.expanded_text   = m.expanded_text,
+            hm.type            = m.type,
+            hm.cui_match       = m.cui_match
         WITH e, m
         CALL {
             WITH e, m
-            WITH e, m WHERE m.str_norm <> ''
-            OPTIONAL MATCH (a:Atom {str_norm: m.str_norm})
-            FOREACH (_ IN CASE WHEN a IS NOT NULL THEN [1] ELSE [] END |
-                MERGE (e)-[:LINKS_TO]->(a)
-            )
+            WITH e, m WHERE m.cui <> ''
+            MERGE (c:Concept {cui: m.cui})
+            MERGE (e)-[:REFERS_TO]->(c)
         }
 """
 
 
+def _build_payload(d: dict) -> dict | None:
+    """Shape one doc's UPSERT payload. Returns None if the doc has no sections."""
+    note = {
+        "doc_id": int(d["doc_id"]),
+        "sample_name": (d.get("sample_name") or "").strip(),
+        "specialty": (d.get("specialty") or "").strip(),
+        "specialty_cui": d.get("specialty_cui") or "",
+        "doctype_cui": d.get("doctype_cui") or "",
+        "alt_cuis": [
+            (alt.get("specialty_cui") or "").strip()
+            for alt in (d.get("alt_specialties") or [])
+            if (alt.get("specialty_cui") or "").strip()
+        ],
+    }
+
+    sections: list[dict] = []
+    for sec in d.get("sections", []):
+        chunk_id = (sec.get("chunk_id") or "").strip()
+        if not chunk_id:
+            continue
+        entities: list[dict] = []
+        for e in sec.get("entities") or []:
+            h = (e.get("entity_hash") or "").strip()
+            if not h:
+                continue
+            entities.append({
+                "entity_hash": h,
+                "surface_text": e.get("surface_text", "") or "",
+                "recognized_text": e.get("recognized_text", "") or "",
+                "resolved_text": e.get("resolved_text", "") or "",
+                "expanded_text": e.get("expanded_text", "") or "",
+                "type": e.get("type", "") or "",
+                "start_char": int(e.get("start_char", 0)),
+                "end_char": int(e.get("end_char", 0)),
+                "cui": e.get("cui") or "",
+                "cui_match": e.get("cui_match", "") or "",
+            })
+        sections.append({
+            "chunk_id": chunk_id,
+            "section_type": sec.get("section_type", "") or "",
+            "section_cui": sec.get("section_cui") or "",
+            "entities": entities,
+        })
+    if not sections:
+        return None
+    return {"note": note, "sections": sections}
+
+
+# ---------- mp.Pool worker state ----------
+
+_DRIVER = None
+_SESSION = None
+_WID = None
+
+
+def _init_worker():
+    global _DRIVER, _SESSION, _WID
+    _DRIVER = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    _SESSION = _DRIVER.session()
+    _WID = f"{os.getpid()}/{uuid.uuid4().hex[:6]}"
+    print(f"[worker {_WID}] neo4j session ready", flush=True)
+
+
+def _process_shard(args: tuple) -> dict:
+    shard_paths = args
+    paths = [Path(p) for p in shard_paths]
+    if not paths:
+        return {"wid": _WID, "docs": 0, "sections": 0, "mentions": 0,
+                "refers_to": 0, "elapsed_s": 0.0}
+
+    t0 = time.time()
+    n_docs = 0
+    n_sections = 0
+    n_mentions = 0
+    n_refers = 0
+
+    # Neo4j's managed transactions auto-retry on TransientError (deadlock
+    # on a shared :Concept MERGE, lock wait timeout, etc.). With N workers
+    # all MERGE-ing popular CUIs like C0013227 (Pharmaceutical Preparations)
+    # deadlocks happen in normal operation; execute_write is the idiomatic
+    # retry wrapper.
+    def _tx_upsert(tx, payload):
+        tx.run(UPSERT_CYPHER, **payload).consume()
+
+    for p in paths:
+        try:
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        payload = _build_payload(d)
+        if payload is None:
+            continue
+        _SESSION.execute_write(_tx_upsert, payload)
+        n_docs += 1
+        n_sections += len(payload["sections"])
+        for sec in payload["sections"]:
+            n_mentions += len(sec["entities"])
+            n_refers += sum(1 for e in sec["entities"] if e["cui"])
+
+    elapsed = time.time() - t0
+    print(f"[worker {_WID}] done: {n_docs} notes, {n_sections} sections, "
+          f"{n_mentions} mentions, {n_refers} with cui  in {elapsed:.1f}s",
+          flush=True)
+    return {"wid": _WID, "docs": n_docs, "sections": n_sections,
+            "mentions": n_mentions, "refers_to": n_refers,
+            "elapsed_s": elapsed}
+
+
+def _shard(seq: list, n: int) -> list[list]:
+    k, m = divmod(len(seq), n)
+    out, i = [], 0
+    for shard_idx in range(n):
+        size = k + (1 if shard_idx < m else 0)
+        out.append(seq[i : i + size])
+        i += size
+    return out
+
+
+def _drop_existing_notes_layer(uri: str, user: str, password: str) -> None:
+    """Delete every :Note, :Section, :Entity (and their edges) but leave the
+    UMLS layer (:Concept, :Atom, :SemanticType, :Source) untouched. Also
+    drop the stale (text, type) uniqueness constraint on :Entity that
+    was created by the old schema -- under the entity_hash-keyed schema
+    two different hashes can share the same resolved text + type, which
+    that constraint would incorrectly reject."""
+    print("dropping existing :Note/:Section/:Entity layer...", flush=True)
+    with GraphDatabase.driver(uri, auth=(user, password)) as driver:
+        with driver.session() as session:
+            # Batch-detach-delete via APOC to avoid tx size blowups.
+            for label in ("Entity", "Section", "Note"):
+                t0 = time.time()
+                n = session.run(
+                    f"MATCH (x:{label}) RETURN count(x) AS n"
+                ).single()["n"]
+                if not n:
+                    print(f"  :{label}  0 existing", flush=True)
+                    continue
+                res = session.run(
+                    "CALL apoc.periodic.iterate("
+                    f"'MATCH (x:{label}) RETURN x', "
+                    "'DETACH DELETE x', "
+                    "{batchSize:5000, parallel:false}) "
+                    "YIELD batches, total RETURN batches, total"
+                ).single()
+                print(f"  :{label}  deleted {res['total']} ({res['batches']} batches) "
+                      f"in {time.time()-t0:.1f}s",
+                      flush=True)
+
+            # Stale constraint from the old (text, type)-keyed schema.
+            stale_constraints = [
+                ("entity_text_type_unique", "DROP CONSTRAINT entity_text_type_unique IF EXISTS"),
+            ]
+            for name, cypher in stale_constraints:
+                session.run(cypher).consume()
+                print(f"  dropped constraint {name} (if existed)", flush=True)
+
+            # Make the new access key uniqueness-enforced.
+            session.run(
+                "CREATE CONSTRAINT entity_hash_unique IF NOT EXISTS "
+                "FOR (e:Entity) REQUIRE e.entity_hash IS UNIQUE"
+            ).consume()
+            print("  ensured constraint entity_hash_unique", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--entities", type=str, default=str(ENTITIES_DEFAULT),
-                    help="path to the per-window entities JSONL")
-    ap.add_argument("--uri", type=str, default=NEO4J_URI)
-    ap.add_argument("--limit", type=int, default=None,
-                    help="process only the first N docs (debug/smoke)")
+    ap.add_argument("--docs", type=Path, default=DOCS_DIR)
+    ap.add_argument("--workers", type=int, default=8,
+                    help="mp.Pool worker count (each owns a Neo4j session)")
+    ap.add_argument("--drop", action="store_true",
+                    help="drop existing :Note/:Section/:Entity before load")
     args = ap.parse_args()
 
-    path = Path(args.entities)
-    print(f"loading entity records from {path}")
+    paths = [str(p) for p in sorted(args.docs.glob("*.json"))]
+    if not paths:
+        raise SystemExit(f"no JSON files in {args.docs}")
 
-    driver = GraphDatabase.driver(args.uri, auth=NEO4J_AUTH)
-    # extract_entities writes records in doc_id order (it sorts the docs
-    # path list before dispatch), so same-doc records are contiguous in the
-    # shard-concatenated JSONL. Stream and flush each doc as its run ends.
-    n_docs = 0
-    n_mentions = 0
-    n_linked = 0
-    current_doc: int | None = None
-    buf: list[dict] = []
+    if args.drop:
+        _drop_existing_notes_layer(NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD)
 
-    def _flush(session) -> None:
-        nonlocal n_docs, n_mentions, n_linked, current_doc, buf
-        if current_doc is None:
-            return
-        payload = _build_doc_payload(current_doc, buf)
-        if payload["sections"]:
-            session.run(UPSERT_CYPHER, **payload).consume()
-            n_docs += 1
-            for sec in payload["sections"]:
-                n_mentions += len(sec["mentions"])
-                n_linked += sum(1 for m in sec["mentions"] if m["str_norm"])
+    workers = max(1, min(args.workers, len(paths)))
+    shards = _shard(paths, workers)
+    sizes = [len(s) for s in shards]
+    print(f"dispatching {len(paths):,} docs across {workers} workers "
+          f"(shard docs={sizes})",
+          flush=True)
 
-    with driver.session() as session:
-        for rec in _iter_entity_records(path):
-            did = int(rec["doc_id"])
-            if did != current_doc:
-                _flush(session)
-                if args.limit is not None and n_docs >= args.limit:
-                    current_doc = None
-                    break
-                current_doc = did
-                buf = []
-            buf.append(rec)
-        _flush(session)
+    ctx = mp.get_context("spawn")
+    wall_t0 = time.time()
+    with ctx.Pool(processes=workers, initializer=_init_worker) as pool:
+        results = pool.map(_process_shard, [shard for shard in shards])
 
-    driver.close()
+    total = {"docs": 0, "sections": 0, "mentions": 0, "refers_to": 0}
+    for r in results:
+        for k in total:
+            total[k] += r.get(k, 0)
+    per_worker = sorted(r.get("elapsed_s", 0.0) for r in results)
+    wall = time.time() - wall_t0
     print(
-        f"merged {n_docs} notes, {n_mentions} mentions, "
-        f"{n_linked} with a str_norm lookup attempted"
+        f"done: {total['docs']:,} notes, {total['sections']:,} sections, "
+        f"{total['mentions']:,} mentions ({total['refers_to']:,} REFERS_TO edges) "
+        f"in {wall:.1f}s wall  "
+        f"[per-worker work {min(per_worker):.1f}..{max(per_worker):.1f}s]",
+        flush=True,
     )
 
 

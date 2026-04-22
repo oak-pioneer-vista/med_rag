@@ -1,37 +1,48 @@
-"""Build per-doc abbreviation maps: Schwartz-Hearst + clinical override + LRABR + MedTE WSD.
+"""Build per-section abbreviation maps: Schwartz-Hearst + clinical override + LRABR + MedTE WSD.
 
-Four-stage per doc:
+Resolution happens at the call site (per Section), not aggregated to
+the doc level. The same surface form can resolve to different
+expansions in different sections of the same doc -- useful when one
+note mixes topics (e.g. `MS` could mean mitral stenosis in PROCEDURE
+and multiple sclerosis in HPI of the same doc, and the section text
+is what disambiguates).
 
-1. **Schwartz-Hearst** over the joined section texts. S-H requires the
-   "long form (ABBR)" introduction to exist somewhere in the doc, so it
-   is the highest-confidence signal ("evidence-in-doc").
+Three-stage per Section:
+
+1. **Schwartz-Hearst** over THIS section's text alone. S-H requires
+   the "long form (ABBR)" introduction inside the same window, so
+   per-section S-H gives many fewer hits than the per-doc variant
+   (most clinical notes introduce abbreviations once at the top, then
+   reuse them across sections); the hits that remain are still the
+   highest-confidence signal because the definition is evidence-in-
+   section.
 
 2. **Curated clinical override** (data/clinical_abbreviations_override.json):
    a small hand-picked list of abbreviations whose clinical sense is
-   overwhelmingly canonical in clinical notes (IV = intravenous,
-   BUN = blood urea nitrogen, CT = computed tomography, ABCD = airway/
-   breathing/circulation/disability, ...). These bypass LRABR entirely
-   -- we trust the override more than the gazetteer for this short list.
+   overwhelmingly canonical regardless of section context (IV =
+   intravenous, BUN = blood urea nitrogen, ABCD = airway/breathing/
+   circulation/disability, ...). These bypass LRABR and don't need a
+   context vector.
 
 3. **LRABR gazetteer + MedTE WSD** for everything the override didn't
    cover. ALL-CAPS candidate tokens that S-H missed are looked up in
-   NLM's SPECIALIST Lexicon LRABR. **Every** LRABR hit -- whether
-   single-sense or ambiguous -- is gated by **MedTE cosine similarity**
-   between the doc context and each candidate expansion, subject to a
-   minimum absolute similarity (`--min-score`, default 0.3). This is
-   load-bearing: many LRABR entries are obscure research/pharmacology
-   senses (e.g. some single-sense entries for common abbrevs point at
-   niche research terms) where the clinical canonical sense isn't in
-   LRABR at all. The threshold lets the embedding decide whether the
-   LRABR sense fits the doc's context.
+   NLM's SPECIALIST Lexicon LRABR. **Every** LRABR hit (single-sense
+   or ambiguous) is gated by MedTE cosine similarity between THIS
+   SECTION's text and each candidate expansion, subject to a minimum
+   absolute similarity (`--min-score`, default 0.3). Per-section
+   context is shorter than the joined-doc context, which is the point
+   -- when a doc spans multiple topics, the WSD shouldn't average
+   them.
 
-Output on each per-doc JSON:
+Output on each section:
 
-  - `abbreviations`        : flat {abbrev: expansion}
-  - `abbreviations_source` : parallel {abbrev: "sh" | "override" | "lrabr"}
-  - `abbreviations_score`  : parallel {abbrev: float} -- 1.0 for S-H
-                             and override hits, cosine similarity for
-                             all LRABR hits
+  - sections[i].abbreviations        : flat {abbrev: expansion}
+  - sections[i].abbreviations_source : parallel {abbrev: "sh"|"override"|"lrabr"}
+  - sections[i].abbreviations_score  : parallel {abbrev: float} -- 1.0 for
+                                       S-H and override, cosine for LRABR
+
+Any legacy doc-level `abbreviations*` fields written by an older
+version of this script are removed on write-back.
 
 Prereqs:
   - data/mtsamples_docs/*.json written by parse_mtsamples.py
@@ -49,6 +60,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -98,22 +110,17 @@ def parse_lrabr(path: Path) -> dict[str, list[str]]:
     return {k: sorted(v) for k, v in grouped.items()}
 
 
-def _sh_pairs(doc: dict) -> dict[str, str]:
-    full = " . ".join(
-        s.get("text", "").strip() for s in doc.get("sections", []) if s.get("text")
-    )
-    if not full:
+def _section_text(section: dict) -> str:
+    return (section.get("text") or "").strip()
+
+
+def _sh_pairs_section(text: str) -> dict[str, str]:
+    """Schwartz-Hearst over a single section's text."""
+    if not text:
         return {}
     return schwartz_hearst.extract_abbreviation_definition_pairs(
-        doc_text=full, most_common_definition=True
+        doc_text=text, most_common_definition=True
     )
-
-
-def _doc_text(doc: dict) -> str:
-    """Join all section texts -- context used for embedding-based WSD."""
-    return " ".join(
-        s.get("text", "") for s in doc.get("sections", []) if s.get("text")
-    ).strip()
 
 
 def embed_batched(texts: list[str], tei_url: str) -> np.ndarray:
@@ -131,6 +138,9 @@ def embed_batched(texts: list[str], tei_url: str) -> np.ndarray:
         )
         r.raise_for_status()
         out.append(np.asarray(r.json(), dtype=np.float32))
+        if (i // TEI_BATCH) and (i // TEI_BATCH) % 10 == 0:
+            print(f"  embedded {min(i + TEI_BATCH, len(texts))}/{len(texts)}",
+                  flush=True)
     vecs = np.concatenate(out, axis=0)
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
@@ -142,17 +152,22 @@ def main() -> None:
     ap.add_argument("--docs", type=Path, default=DOCS_DIR)
     ap.add_argument("--lrabr", type=Path, default=LRABR_PATH)
     ap.add_argument("--override", type=Path, default=OVERRIDE_PATH)
-    ap.add_argument("--tei-url", default=TEI_URL_DEFAULT, help=f"(default: {TEI_URL_DEFAULT})")
+    ap.add_argument("--tei-url", default=TEI_URL_DEFAULT,
+                    help=f"(default: {TEI_URL_DEFAULT})")
     ap.add_argument("--min-score", type=float, default=0.3,
-                    help="minimum cosine similarity for LRABR picks, single or ambiguous (default: 0.3)")
-    ap.add_argument("--no-gazetteer", action="store_true", help="skip LRABR pass (S-H + override only)")
-    ap.add_argument("--no-override", action="store_true", help="skip curated override pass")
+                    help="minimum cosine similarity for LRABR picks "
+                         "(default: 0.3)")
+    ap.add_argument("--no-gazetteer", action="store_true",
+                    help="skip LRABR pass (S-H + override only)")
+    ap.add_argument("--no-override", action="store_true",
+                    help="skip curated override pass")
     args = ap.parse_args()
 
     paths = sorted(args.docs.glob("*.json"))
     if not paths:
         raise SystemExit(
-            f"no JSON files in {args.docs} -- run python/ingestion/mtsamples/parse_mtsamples.py first"
+            f"no JSON files in {args.docs} -- run "
+            f"python/ingestion/mtsamples/parse_mtsamples.py first"
         )
 
     override: dict[str, str] = {}
@@ -160,7 +175,8 @@ def main() -> None:
         if not args.override.exists():
             raise SystemExit(f"missing {args.override}")
         override = load_override(args.override)
-        print(f"loaded clinical override: {len(override):,} abbreviations")
+        print(f"loaded clinical override: {len(override):,} abbreviations",
+              flush=True)
 
     lrabr: dict[str, list[str]] = {}
     if not args.no_gazetteer:
@@ -171,108 +187,139 @@ def main() -> None:
             )
         lrabr = parse_lrabr(args.lrabr)
         n_multi = sum(1 for v in lrabr.values() if len(v) > 1)
-        print(f"loaded LRABR: {len(lrabr):,} abbrevs ({n_multi:,} ambiguous)")
+        print(f"loaded LRABR: {len(lrabr):,} abbrevs ({n_multi:,} ambiguous)",
+              flush=True)
 
-    # ---- Pass 1: load docs, run S-H, queue every LRABR candidate occurrence.
+    # ---- Pass 1: per-section S-H + override; queue LRABR work per section.
     docs: list[tuple[Path, dict]] = []
-    # (doc_idx, tok, up) for each LRABR candidate occurrence
-    work: list[tuple[int, str, str]] = []
+    # Each work item: (doc_idx, sec_idx, tok, up)
+    work: list[tuple[int, int, str, str]] = []
+    n_sections_total = 0
+    n_sections_with_text = 0
+    t0 = time.time()
 
     for p in paths:
         doc = json.loads(p.read_text(encoding="utf-8"))
-        sh = _sh_pairs(doc)
-        doc["abbreviations"] = dict(sh)
-        doc["abbreviations_source"] = {k: "sh" for k in sh}
-        doc["abbreviations_score"] = {k: 1.0 for k in sh}
-        sh_upper = {k.upper() for k in sh}
+        # Drop legacy doc-level fields written by older versions.
+        for k in ("abbreviations", "abbreviations_source", "abbreviations_score"):
+            doc.pop(k, None)
 
-        seen_upper: set[str] = set()
-        doc_idx = len(docs)
-        for section in doc.get("sections", []):
-            text = section.get("text") or ""
+        di = len(docs)
+        for si, section in enumerate(doc.get("sections", [])):
+            n_sections_total += 1
+            text = _section_text(section)
+            sh = _sh_pairs_section(text) if text else {}
+            section["abbreviations"] = dict(sh)
+            section["abbreviations_source"] = {k: "sh" for k in sh}
+            section["abbreviations_score"] = {k: 1.0 for k in sh}
+            if not text:
+                continue
+            n_sections_with_text += 1
+
+            sh_upper = {k.upper() for k in sh}
+            seen_upper: set[str] = set()
             for m in ABBREV_TOKEN_RE.finditer(text):
                 tok = m.group(0)
                 up = tok.upper()
                 if up in seen_upper or up in sh_upper:
                     continue
                 seen_upper.add(up)
-                # Curated override wins over LRABR for truly canonical
-                # clinical abbreviations. We trust the override more than
-                # the gazetteer here, so no embedding check.
                 if up in override:
-                    doc["abbreviations"][tok] = override[up]
-                    doc["abbreviations_source"][tok] = "override"
-                    doc["abbreviations_score"][tok] = 1.0
+                    section["abbreviations"][tok] = override[up]
+                    section["abbreviations_source"][tok] = "override"
+                    section["abbreviations_score"][tok] = 1.0
                 elif up in lrabr:
-                    work.append((doc_idx, tok, up))
+                    work.append((di, si, tok, up))
         docs.append((p, doc))
+        if len(docs) % 500 == 0:
+            print(f"  scanned {len(docs)}/{len(paths)} docs "
+                  f"({n_sections_total} sections, {len(work)} LRABR queue depth)",
+                  flush=True)
 
-    # ---- Pass 2: batch-embed doc contexts and unique candidate expansions.
-    print(f"LRABR candidate occurrences queued: {len(work):,}")
+    print(f"pass 1 done in {time.time()-t0:.1f}s: "
+          f"{n_sections_total} sections ({n_sections_with_text} with text), "
+          f"{len(work)} LRABR candidate occurrences queued",
+          flush=True)
 
+    # ---- Pass 2: batch-embed section contexts and unique candidate expansions.
     if work:
-        # Unique docs needing embedding (by index into `docs`)
-        needed_doc_idxs = sorted({w[0] for w in work})
-        doc_texts = [_doc_text(docs[i][1]) for i in needed_doc_idxs]
-        doc_idx_to_row = {di: row for row, di in enumerate(needed_doc_idxs)}
+        # Unique (doc_idx, sec_idx) needing context embedding.
+        needed_keys = sorted({(di, si) for (di, si, _, _) in work})
+        section_texts: list[str] = []
+        section_key_to_row: dict[tuple[int, int], int] = {}
+        for row, (di, si) in enumerate(needed_keys):
+            section_key_to_row[(di, si)] = row
+            sec = docs[di][1]["sections"][si]
+            section_texts.append(_section_text(sec))
 
-        # Unique expansions across all ambiguous abbrevs encountered
+        # Unique expansions across all candidates.
         unique_expansions: dict[str, int] = {}
         expansion_texts: list[str] = []
-        for _, _, up in work:
+        for _, _, _, up in work:
             for exp in lrabr[up]:
                 if exp not in unique_expansions:
                     unique_expansions[exp] = len(expansion_texts)
                     expansion_texts.append(exp)
 
         print(
-            f"embedding {len(doc_texts):,} doc contexts and "
-            f"{len(expansion_texts):,} expansions via {args.tei_url} ..."
+            f"embedding {len(section_texts):,} section contexts and "
+            f"{len(expansion_texts):,} expansions via {args.tei_url} ...",
+            flush=True,
         )
+        t1 = time.time()
         try:
-            doc_vecs = embed_batched(doc_texts, args.tei_url)
+            sec_vecs = embed_batched(section_texts, args.tei_url)
             exp_vecs = embed_batched(expansion_texts, args.tei_url)
         except requests.RequestException as e:
             print(f"error: TEI request failed ({e}). "
                   f"Is medte running? `docker compose up -d medte`",
                   file=sys.stderr)
             sys.exit(1)
+        print(f"  embeddings done in {time.time()-t1:.1f}s", flush=True)
 
-        # ---- Pass 3: resolve each ambiguous occurrence by cosine sim.
+        # ---- Pass 3: resolve each LRABR occurrence by cosine sim against
+        # its parent section's context vector.
         n_resolved = 0
         n_below_threshold = 0
-        for doc_idx, tok, up in work:
+        for di, si, tok, up in work:
             exps = lrabr[up]
-            dv = doc_vecs[doc_idx_to_row[doc_idx]]
+            sv = sec_vecs[section_key_to_row[(di, si)]]
             ev = exp_vecs[np.array([unique_expansions[e] for e in exps])]
-            sims = ev @ dv
+            sims = ev @ sv
             best = int(np.argmax(sims))
             score = float(sims[best])
             if score < args.min_score:
                 n_below_threshold += 1
                 continue
-            docs[doc_idx][1]["abbreviations"][tok] = exps[best]
-            docs[doc_idx][1]["abbreviations_source"][tok] = "lrabr"
-            docs[doc_idx][1]["abbreviations_score"][tok] = round(score, 4)
+            sec = docs[di][1]["sections"][si]
+            sec["abbreviations"][tok] = exps[best]
+            sec["abbreviations_source"][tok] = "lrabr"
+            sec["abbreviations_score"][tok] = round(score, 4)
             n_resolved += 1
         print(
             f"resolved {n_resolved:,} by cosine, "
-            f"skipped {n_below_threshold:,} below --min-score={args.min_score}"
+            f"skipped {n_below_threshold:,} below --min-score={args.min_score}",
+            flush=True,
         )
 
-    # ---- Write back.
-    n_with_abbrev = 0
+    # ---- Write back. Tally section-level stats.
+    n_sections_with_abbrev = 0
     counts = {"sh": 0, "override": 0, "lrabr": 0}
     for p, doc in docs:
+        for sec in doc.get("sections", []):
+            sec_map = sec.get("abbreviations") or {}
+            if sec_map:
+                n_sections_with_abbrev += 1
+                for s in (sec.get("abbreviations_source") or {}).values():
+                    if s in counts:
+                        counts[s] += 1
         p.write_text(json.dumps(doc, ensure_ascii=False), encoding="utf-8")
-        if doc["abbreviations"]:
-            n_with_abbrev += 1
-            for s in doc["abbreviations_source"].values():
-                if s in counts:
-                    counts[s] += 1
+
     print(
-        f"updated {len(docs)} docs  ({n_with_abbrev} with >=1 abbreviation; "
-        f"{counts['sh']} S-H, {counts['override']} override, {counts['lrabr']} LRABR)"
+        f"updated {len(docs)} docs / {n_sections_total:,} sections "
+        f"({n_sections_with_abbrev:,} sections with >=1 abbreviation; "
+        f"{counts['sh']} S-H, {counts['override']} override, {counts['lrabr']} LRABR)",
+        flush=True,
     )
 
 

@@ -159,6 +159,36 @@ Dropping the competing half of the query lifted peak score from 0.74 → 0.85 an
 
 **Takeaway.** Schwartz-Hearst and LRABR-style dictionary tagging solve disjoint halves of the abbreviation problem — parenthetical introductions vs. bare mentions. You need both, and on clinical text you also need a clinical-specific supplement because `LRABR` was assembled for PubMed, not discharge summaries.
 
+## Abbreviation expansion strings drift across the lexicons
+
+**Context.** A one-off audit pass over the per-doc abbreviation map output (when step 6 still resolved at the doc level — it's now per-section) bucketed every abbreviation that resolved to ≥2 distinct expansion strings somewhere in the corpus and printed each expansion with the doc-ids that produced it. The abbreviation lookup sources (LRABR, the curated override, Schwartz-Hearst) all emit raw expansion strings as-is from their upstream tables, so anything cosmetic that's inconsistent in the source is inconsistent in the resolved output too.
+
+**Headline number from that pass.** 18,336 sections, 3,077 with ≥1 abbrev hit, 523 distinct hit abbrevs, and **155 of those 523 (~30%)** resolved to ≥2 distinct expansion strings. (Under the current per-section resolver this number is different by construction — each section is its own context, so divergence across sections is expected — but the surface-form-drift component below is a property of the lexicons themselves and survives any change to the resolver layer.)
+
+**Two distinct flavors hide inside that 30%.**
+
+*Genuine sense ambiguity* — same surface form, genuinely different concepts. The MedTE WSD layer correctly picks different senses based on context:
+- `CD` → coronary disease (doc 1855) vs colorectal distension (doc 1971)
+- `IC` → irritable colon / intra coronary / internal carotid (3 docs, 3 anatomies)
+
+*Surface-form variants of the same concept* — same intended meaning, cosmetically different strings. Pure noise from the upstream lexicons; survives any resolver-layer redesign:
+- `AIDS` → 4 spellings of "acquired immunodeficiency syndrome"
+- `COPD` → lowercase (42 docs) vs Capitalized (2 docs)
+- `CABG` → 3 case variants including a `Graph`-for-`Graft` typo
+- `GERD` → `gastroesophageal` (27 docs) vs hyphenated `gastro esophageal` (1 doc)
+- `FL` → US `fetal liver` vs UK `foetal liver`
+- `T5` → `thoracic vertebra 5` vs `fifth thoracic vertebra`
+
+**Why it matters.** Downstream entity linking keys off the expansion string — `expanded_text` is fed to `Atom.str_norm` exact match in step 11 (`link_entities_to_cui.py`). Surface variants like `Graph`/`Graft` or `foetal`/`fetal` fragment the same concept across multiple lookups; some hit, some miss. Without a normalization pass before linking, a meaningful fraction of multi-expansion abbrevs are doing nothing more than splitting the same CUI across a cosmetic spelling difference.
+
+**Cheap normalization layers, in order of cost.**
+1. **Casefold + whitespace-collapse** the expansion strings before they reach the linker. Kills `COPD`/`copd` and `gastroesophageal`/`gastro esophageal` splits for free.
+2. **Edit-distance dedup** (Levenshtein ≤ 2) within the same abbrev's expansion set, majority doc-count wins. Catches `Graph`/`Graft`, `foetal`/`fetal`, `immune`/`immuno`. Per-abbrev expansion sets are tiny so the cost is negligible.
+
+Genuine sense ambiguity (CD, IC, …) survives both passes — exactly what we want. Normalization suppresses cosmetic noise without touching the WSD layer.
+
+**Takeaway.** "Abbrev X resolved to N different expansions" isn't a single phenomenon — it's true ambiguity and surface-string drift mixed together. Sampling a handful and printing originating doc-ids is enough to separate them at a glance (different concepts cluster apart; cosmetic variants look near-identical). Worth running ad-hoc whenever the abbrev resolver design changes, even if the audit script doesn't live in the persistent pipeline.
+
 ## TODO: lexical vs. semantic linking after entity resolution
 
 **Status.** Open question. Decide before wiring the post-resolution step.
