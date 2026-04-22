@@ -65,15 +65,7 @@ Data for both is persisted in Docker volumes. Verify the Neo4j connection with:
 python python/neo4j_smoke_test.py
 ```
 
-### 3. Ingest into Qdrant
-
-```bash
-python python/ingestion/mtsamples/ingest_mtsamples.py
-```
-
-Embeds medical transcriptions using `all-MiniLM-L6-v2` and upserts them into a `mtsamples` Qdrant collection with metadata (specialty, description, keywords).
-
-### 4. Ingest UMLS into Neo4j
+### 3. Ingest UMLS into Neo4j
 
 Two-step pipeline: unzip + convert RRF files to admin-import CSVs, then bulk-load. Both steps are parallelized — the RRF-to-CSV pass uses one worker per CPU core (`multiprocessing` in `umls_to_neo4j_csv.py`), and `neo4j-admin database import` runs with `--threads=32 --high-parallel-io=on`.
 
@@ -110,7 +102,7 @@ Imported into Neo4j: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO ro
 
 A pre-built snapshot of the imported store is at `gs://med_rag/neo4j_processed/neo4j_data.tar.zst` (~900 MB) — restore by extracting into the `med_rag_neo4j_data` Docker volume with neo4j stopped.
 
-### 5. Clean MTSamples (drop empty transcripts, dedupe cross-filings)
+### 4. Clean MTSamples (drop empty transcripts, dedupe cross-filings)
 
 ```bash
 python python/ingestion/mtsamples/clean_mtsamples.py
@@ -118,7 +110,7 @@ python python/ingestion/mtsamples/clean_mtsamples.py
 
 MTSamples cross-files the same note under multiple `medical_specialty` tags with byte-identical `transcription`. This step drops rows with no transcription, collapses duplicate transcriptions (keeping first-row metadata, recording dropped specialty names in `alt_specialties`, and unioning keyword tokens), and writes the survivors to `data/mtsamples_clean.jsonl`. Expected: **4,966 raw rows → 2,357 cleaned records** (2,150 clusters collapsed, 2,609 dupe rows dropped).
 
-### 6. Parse MTSamples into per-doc JSON
+### 5. Parse MTSamples into per-doc JSON
 
 Splits each cleaned transcription on ALL-CAPS `HEADING:` tokens and emits one `MTSampleDoc` JSON per row into `data/mtsamples_docs/`. These intermediates are what the embedding step in `python/ingestion/mtsamples/embed_sections.py` consumes.
 
@@ -132,7 +124,7 @@ python python/ingestion/mtsamples/parse_mtsamples.py [--workers 16]
 
 Result: **2,357 per-doc JSONs** under `data/mtsamples_docs/{doc_id:04d}.json`. Each doc carries `doc_id`, `specialty`, `specialty_cui`, `doctype_cui` (explicit mapping or heuristic rule), `sample_name`, merged `keywords`, `alt_specialties` (list of `{specialty, specialty_cui, doctype_cui}` from the dropped cross-filings — every entry has at least one CUI populated), and a list of `Section` records (`chunk_id`, `section_type`, `text`, plus placeholders for `embedding` and `entities` populated downstream). `doctype_cui` is set on 1,634/2,357 docs (specialties without an explicit mapping in `data/doctype_cui.json` and no matching heading rule get `""`).
 
-### 7. Build per-doc abbreviation maps (Schwartz-Hearst + override + LRABR + MedTE WSD)
+### 6. Build per-doc abbreviation maps (Schwartz-Hearst + override + LRABR + MedTE WSD)
 
 Four-stage resolution with provenance tracking. Each doc gets `abbreviations`, `abbreviations_source` (`sh`/`override`/`lrabr`), and `abbreviations_score` (1.0 for S-H and override hits, cosine similarity for LRABR hits) written into its per-doc JSON.
 
@@ -151,7 +143,7 @@ python python/ingestion/mtsamples/build_abbreviations.py [--min-score 0.3]
 
 Expected yield on MTSamples: **~1,500/2,357 docs** (64%) with ≥1 pair. Typical run: **143 S-H, ~2,400 override, ~1,500 LRABR**; ~4,500 LRABR candidates skipped below threshold. Uniform threshold gate is load-bearing — without it, single-sense LRABR hits for `ABCD`/`AICD`/`PSA`/etc. would inject wrong-sense expansions in clinical docs.
 
-### 8. Extract per-section entities with spans (Stanza i2b2 NER)
+### 7. Extract per-section entities with spans (Stanza i2b2 NER)
 
 ```bash
 # GPU path (fastest): if host cuDNN lags torch's bundled cuDNN, prepend the venv's
@@ -167,7 +159,7 @@ python python/ingestion/mtsamples/extract_section_entities.py --cpu
 
 Runs Stanza's `mimic/i2b2` NER over each Section's text (sections are the logical unit — not Qdrant-aligned windows) and fills each Section's `entities` list in the per-doc JSON. Each entity record carries `surface_text` (literal section-text slice), `recognized_text` (Stanza's output), i2b2 `type` (`PROBLEM` / `TEST` / `TREATMENT`), and section-local `start_char` / `end_char`.
 
-**This step is deliberately idempotent and text-normalization-free.** All derived text fields (`resolved_text`, `expanded_text`) are computed in step 9 from these raw records, so iterating on normalization rules doesn't require re-running Stanza.
+**This step is deliberately idempotent and text-normalization-free.** All derived text fields (`resolved_text`, `expanded_text`) are computed in step 8 from these raw records, so iterating on normalization rules doesn't require re-running Stanza.
 
 Parallelism uses `multiprocessing.Pool` with `spawn` start method so each worker gets a clean CUDA context; doc paths are sharded via **Longest-Processing-Time-first bin packing** on total section char-count (keeps the heaviest shard within ~4/3 of the mean, vs equal-doc-count sharding that lumped several 2K-token PROCEDURE notes together and stretched wall time by 30%+). Within each worker, sections are **length-sorted descending** before batching so Stanza's padding-to-longest-in-batch waste is near-zero on a corpus with p50=23 / p99=863 / max=2,819 MedTE tokens.
 
@@ -179,19 +171,19 @@ Expected on MTSamples: **~121K entities across ~18K non-empty sections in ~91s o
 
 This is distinct from `python/ingestion/mtsamples/extract_entities.py`, which targets Qdrant-aligned chunk windows for the retrieval pipeline. The two produce complementary artifacts: section entities live inside the per-doc JSON (coarse-grained, directly usable by the Neo4j loader's Section→Entity layer), while chunk entities live in `data/entities/chunk_entities.jsonl` and key off `chunk_id` for joins with Qdrant points.
 
-### 9. Normalize per-section entities (strip articles + expand abbreviations)
+### 8. Normalize per-section entities (strip articles + expand abbreviations)
 
 ```bash
 python python/ingestion/mtsamples/normalize_section_entities.py
 ```
 
-Derives two text fields per entity record from the `recognized_text` written by step 8:
+Derives two text fields per entity record from the `recognized_text` written by step 7:
 - `resolved_text` — `recognized_text` with articles (`a`/`an`/`the`) removed and whitespace collapsed. Reserved as the NER canonical surface; future string-level normalization rules chain in here.
-- `expanded_text` — `resolved_text` with known abbreviations substituted using the doc's `abbreviations` map (step 7), then article-stripped again in case the expansion introduced one. Use this for UMLS/Neo4j grounding and dense-retrieval keying, where the expanded form matches more Concept atoms.
+- `expanded_text` — `resolved_text` with known abbreviations substituted using the doc's `abbreviations` map (step 6), then article-stripped again in case the expansion introduced one. Use this for UMLS/Neo4j grounding and dense-retrieval keying, where the expanded form matches more Concept atoms.
 
 Pure Python string work — no GPU, no heavy compute. **Typically finishes in ~2s over all 18K entities**, vs the ~91s cost of re-running NER. That's the payoff of keeping the layers separate: iterate on the stopword list, the token regex, or any new normalization rule in a fast edit-run-inspect loop without paying the NER tax each time. Expected on MTSamples: **~32K entities get an article stripped (26%)**, **~4K entities (3.4%)** get an abbrev expansion that changes `expanded_text` relative to `resolved_text`.
 
-### 10. Link specialties to UMLS CUIs
+### 9. Link specialties to UMLS CUIs
 
 ```bash
 python python/ingestion/mtsamples/link_specialty_to_cui.py
@@ -201,7 +193,7 @@ Resolves both `doc['specialty']` and every `doc['alt_specialties'][i]['specialty
 
 Expected: all 40 unique specialty strings resolve (~0.3s); ~1,400 alt_specialty entries get updated CUIs across ~1,270 docs.
 
-### 11. Link section types to UMLS CUIs
+### 10. Link section types to UMLS CUIs
 
 ```bash
 python python/ingestion/mtsamples/link_sections_to_cui.py
@@ -211,7 +203,7 @@ For every Section's `section_type`, applies a small alias map (`HPI` → `histor
 
 Expected: **~1,736/1,778 unique section_type values resolved (97.6%)**; `HPI` and `HISTORY OF PRESENT ILLNESS` both → `C0262512`. ~52s on a warm Neo4j.
 
-### 12. Link entities to UMLS CUIs + TUIs (dask map-reduce)
+### 11. Link entities to UMLS CUIs + TUIs (dask map-reduce)
 
 ```bash
 python python/ingestion/mtsamples/link_entities_to_cui.py [--workers 16] [--batch 500]
@@ -242,13 +234,13 @@ Fields written per entity:
 
 Expected on MTSamples: **~119K of 121K entities linked (~98%)**, 100% of linked entities carry ≥1 TUI. Top semantic types across the corpus: **T033 Finding (16.6K), T061 Therapeutic/Preventive Procedure (13.8K), T047 Disease or Syndrome (12.6K), T074 Medical Device (9.9K), T121 Pharmacologic Substance (8.9K), T184 Sign or Symptom (8.3K)** — i.e. the distribution a clinical corpus should produce.
 
-### 13. Sentence-chunk sections + tag each sentence with linked entity sets
+### 12. Sentence-chunk sections + tag each sentence with linked entity sets
 
 ```bash
 python python/ingestion/mtsamples/chunk_sentences.py [--workers 8] [--batch 128]
 ```
 
-For every Section, splits the text into sentences using **Stanza's `mimic` clinical tokenizer** (same tokenizer used by step 8 for NER — handles medical abbreviations like `q.i.d.`, `2.5 mg`, `Dr.`, and does better on MTSamples' comma-pseudo-paragraph style than a bare regex). For each sentence, scans for the presence of any linked entity's surface form (word-boundary, case-insensitive) via a single compiled alternation regex per doc. Matched entities contribute to three per-sentence sets:
+For every Section, splits the text into sentences using **Stanza's `mimic` clinical tokenizer** (same tokenizer used by step 7 for NER — handles medical abbreviations like `q.i.d.`, `2.5 mg`, `Dr.`, and does better on MTSamples' comma-pseudo-paragraph style than a bare regex). For each sentence, scans for the presence of any linked entity's surface form (word-boundary, case-insensitive) via a single compiled alternation regex per doc. Matched entities contribute to three per-sentence sets:
 
 - `cuis` — sorted list of UMLS CUIs covered in this sentence
 - `tuis` — sorted list of semantic TUIs in this sentence
@@ -256,9 +248,34 @@ For every Section, splits the text into sentences using **Stanza's `mimic` clini
 
 Written back as `section.sentences = [{text, cuis, tuis, surface_forms}, ...]`.
 
-Parallelism is `mp.Pool` with `spawn` start method (same pattern as step 8). Each worker loads Stanza once in its initializer and processes its shard's sections in batches of `--batch` via `nlp.bulk_process`. Per-doc surface-form indices are compiled once per doc and reused across all sections of that doc, so a sentence is scanned against all candidate surface forms in one pass.
+Parallelism is `mp.Pool` with `spawn` start method (same pattern as step 7). Each worker loads Stanza once in its initializer and processes its shard's sections in batches of `--batch` via `nlp.bulk_process`. Per-doc surface-form indices are compiled once per doc and reused across all sections of that doc, so a sentence is scanned against all candidate surface forms in one pass.
 
 Expected on MTSamples: **~83K sentences across 18K sections in ~20s wall on L4 (8 workers, batch=128)**; ~74% of sentences carry ≥1 CUI hit. Stanza catches ~800 more sentence boundaries than the naive regex, mostly in operative-note comma-joined clauses.
+
+### 13. Embed sentence-level chunks into Qdrant
+
+```bash
+docker compose up -d medte qdrant
+python python/ingestion/mtsamples/embed_sentences.py [--workers 16] [--batch 32] [--recreate]
+```
+
+Embeds each sentence chunk (produced by step 12) via MedTE/TEI and upserts one Qdrant point per sentence into the `mtsamples_sentences` collection. Point id is `uuid5(chunk_id)` so re-runs are idempotent. Parallelism is `mp.Pool` — each worker owns an HTTP session + Qdrant client; TEI does server-side dynamic batching across concurrent worker requests.
+
+**Payload carries full provenance** (all fields payload-indexed): `chunk_id`, `section_chunk_id`, `doc_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `alt_specialty_cuis`, `doctype_cui`, `cuis`, `tuis`, `surface_forms`, `text`. Enables index-only filters like *"sentences in General Medicine notes, HPI section, mentioning C0001175"* before any vector search.
+
+**Tuned defaults** (`--workers 16 --batch 32`) from a sweep on L4:
+
+| workers | batch | wall | rate |
+|---:|---:|---:|---:|
+| 16 | 16 | 17.9s | 4,658/s |
+| **16** | **32** | **15.5s** | **5,380/s** |
+| 16 | 64 | — | HTTP 429 (TEI queue saturated) |
+| 8  | 64 | 20.9s | 3,984/s |
+| 32 | 64 | — | HTTP 429 |
+
+16×64 and 32×64 overwhelm TEI's concurrent-request queue; 8×64 starves the GPU. 16×32 is the knee. If you bump `--workers`, re-tune `--batch` so `workers × batch` stays under TEI's effective concurrency budget (the script does exponential backoff on 429 so transient saturation doesn't crash the job).
+
+Expected on MTSamples: **~83K sentences embedded + upserted in ~16s wall**. Collection is configured with `cosine` distance and `indexing_threshold=100` so segments get indexed promptly (default would leave small segments unindexed, falling back to brute-force search).
 
 ### 14. Embed section text into Qdrant
 

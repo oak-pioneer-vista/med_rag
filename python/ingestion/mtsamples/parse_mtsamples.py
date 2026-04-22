@@ -10,8 +10,7 @@ data/mtsamples_docs/ so downstream stages (embedding, NER, indexing)
 can fan out per file.
 
 Input is the cleaned+deduped JSONL produced by clean_mtsamples.py;
-`doc_id` is the row position within that file, so it lines up with the
-point ids in `ingest_mtsamples.py`.
+`doc_id` is the row position within that file.
 
 Outputs:
   - data/mtsamples_docs/{doc_id:04d}.json  (one file per MTSampleDoc)
