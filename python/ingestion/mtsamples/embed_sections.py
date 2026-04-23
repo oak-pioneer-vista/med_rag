@@ -40,6 +40,7 @@ DOCS_DIR = REPO / "data" / "mtsamples_docs"
 MODEL_ID = "MohammadKhodadad/MedTE-cl15-step-8000"
 COLLECTION = "mtsamples_sections"
 QDRANT_URL = "http://localhost:6333"
+QDRANT_GRPC_PORT = 6334
 TEI_URL = "http://localhost:8080"
 # Deterministic uuid5 namespace so re-runs upsert into the same point id.
 POINT_NS = uuid.UUID("6f3c0c2a-6c2c-4c9a-b9ea-0ea0d3f8f5a1")
@@ -196,7 +197,7 @@ def _process_partition(paths: Iterable[str]) -> list[tuple[int, int]]:
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     session = requests.Session()
     dim = _probe_dim(session)
-    client = QdrantClient(url=QDRANT_URL, timeout=60)
+    client = QdrantClient(url=QDRANT_URL, prefer_grpc=True, grpc_port=QDRANT_GRPC_PORT, timeout=60)
 
     all_texts: list[str] = []
     all_ids: list[str] = []
@@ -245,7 +246,7 @@ def main() -> None:
         dim = _probe_dim(s)
     print(f"embedding dim={dim}")
 
-    client = QdrantClient(url=QDRANT_URL, timeout=60)
+    client = QdrantClient(url=QDRANT_URL, prefer_grpc=True, grpc_port=QDRANT_GRPC_PORT, timeout=60)
     if args.recreate and client.collection_exists(COLLECTION):
         client.delete_collection(COLLECTION)
     if not client.collection_exists(COLLECTION):

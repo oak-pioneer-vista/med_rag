@@ -23,6 +23,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import OptimizersConfigDiff, PayloadSchemaType
 
 QDRANT_URL = "http://localhost:6333"
+QDRANT_GRPC_PORT = 6334
 COLLECTION = "mtsamples_sections"
 INDEXING_THRESHOLD = 100
 
@@ -43,7 +44,7 @@ INTEGER_FIELDS = [
 
 
 def main() -> None:
-    client = QdrantClient(url=QDRANT_URL, timeout=60)
+    client = QdrantClient(url=QDRANT_URL, prefer_grpc=True, grpc_port=QDRANT_GRPC_PORT, timeout=60)
     if not client.collection_exists(COLLECTION):
         raise SystemExit(
             f"collection {COLLECTION!r} doesn't exist — "

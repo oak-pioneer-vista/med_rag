@@ -51,6 +51,21 @@ Against a verbatim sentence copied from a source document, the same encoder peak
 
 **Takeaway.** For any fan-out embedding pipeline, front the model with TEI (or another dedicated inference server) and make the dask/worker layer a batching HTTP client. You get better GPU utilization, simpler client dependencies, and clean separation of "shape my data" from "run the model" — at the cost of one extra process to operate.
 
+## JSON serialization tax on TEI + Qdrant for bulk loads
+
+**Context.** The TEI note above argues for fronting embedding with an inference server and making workers HTTP clients. That's the right default for online / mixed traffic. For **one-shot bulk corpus loads** (embed N million passages once, never re-embed), the HTTP+JSON layer adds a per-float serialization tax that can eat more wall time than the GPU forward pass — and the tradeoff flips back toward in-process inference.
+
+**Where the tax lives.**
+- **TEI `/embed` responses are JSON.** A 768-d fp32 vector comes back as ~768 ASCII float literals in an array — roughly **3× the raw byte cost** (~12 bytes/float vs. 4 bytes) plus O(N·D) client-side parsing back to Python floats. `orjson` / `ujson` trim the parse constant but don't remove it.
+- **Qdrant REST upserts pay the same tax on the write side.** The Python client defaults to REST, which ships each upsert vector as ASCII floats inside JSON. Batching amortizes HTTP overhead but not per-float serialization.
+- Combined, both ends of the pipe are marshalling vectors through JSON. Classic "server waits for client to catch up" shape: high client CPU, low GPU utilization, throughput capped well below what the model itself can produce.
+
+**Mitigations for bulk loads.**
+- **Skip TEI and call the model in-process** with your own batching. Weights stay on the GPU across batches and outputs stay as numpy/torch tensors — no serialization in either direction. You lose TEI's dynamic-batching-across-clients, but for a single-process or small-pool bulk loader a length-sorted fixed-batch loop (same playbook as the NER note below) gets comparable GPU utilization without the JSON round-trip.
+- **Switch Qdrant to gRPC** (`QdrantClient(url=..., prefer_grpc=True)`) so vectors go over the wire as protobuf fp32 (4 bytes/float, no ASCII parse). For the tightest bulk path, `upload_collection` streams a numpy array directly into the server.
+
+**Takeaway.** TEI-over-REST + Qdrant-over-REST is the right default for online / mixed traffic — the JSON cost is amortized against human-scale latency and the operational simplicity is worth it. For offline bulk embedding loads, the JSON float tax on both the TEI→client and client→Qdrant hops is real and often dominates wall time — call the model directly and upsert over gRPC (or `upload_collection`) to close the gap with raw GPU throughput.
+
 ## Batching NER inference without a dedicated server
 
 **Context.** TEI (previous section) covers the embedding case: one inference server, many HTTP clients, server-side dynamic batching. NER doesn't have that luxury — Stanza's `mimic/i2b2` biLSTM-CRF runs in-process on each worker, with no "NER server" to front it. `python/ingestion/mtsamples/extract_section_entities.py` processes ~18K non-empty sections across 2,357 docs; the naive "iterate and call `nlp(text)` per section" leaves the GPU at single-digit utilization because every call is effectively a batch of 1. This note documents the three knobs that matter when you own the batching yourself.
@@ -217,3 +232,25 @@ Genuine sense ambiguity (CD, IC, …) survives both passes — exactly what we w
 - Split or flag negated spans before embedding so the encoder sees only positive assertions, or embed negated spans into a separate namespace/field.
 - Cross-encoder reranker trained on assertion-sensitive pairs over the top-k bi-encoder hits.
 - Evaluate negation-aware clinical encoders (e.g. CORE-style, or models trained with hard-negative pairs that include polarity flips).
+
+## TODO: section-window retrieval surface
+
+**Status.** Removed from the ingestion pipeline (was step 15 — ~22.8K 200-token section-windows embedded via MedTE/TEI into a parallel `mtsamples_sections` Qdrant collection). Revisit if note-level retrieval shows up as a downstream need.
+
+**Problem.** Sentence-level retrieval (step 14) is the surviving surface. It supports fine-grained entity filters and precise evidence hits, but doesn't obviously answer "which *note* is most relevant" — that needs a dedicated index *or* a query-time rollup over sentence hits by `doc_id` / `section_chunk_id`. The rollup approximation is untested.
+
+**Why it mattered originally.** The section-window collection gave a stable note-level ranking signal: on the leukemia retrieval sanity check, the target note surfaced 7 times across distinct sections in the top-50 (ASSESSMENT, three HPI windows, LAB, CHIEF COMPLAINT, FAMILY HISTORY), and "37 unique docs among 50 hits" was a note-diversity number that's hard to read off raw sentence hits. The ~200-token unit also sits closer to MedTE's training distribution than a single sentence for vague/conceptual queries.
+
+**Why removed.** Two parallel retrieval collections cost embedding time, storage, and a "which collection for this query" routing layer. Sentence hits already carry enough provenance (`doc_id`, `section_chunk_id`, `section_type`, `cuis`, `tuis`) that a group-by at query time should be able to synthesize note-level ranking without a second index — in principle.
+
+**Options to consider when revisiting.**
+- Evaluate sentence-hit rollup (count-per-doc, max/mean score, section-type diversity) against the section-window baseline on a concrete note-ranking task before concluding the rollup is enough. The headline question is whether a note whose `HPI` + `ASSESSMENT` + `LAB` sentences all hit reliably beats a note with one stray `FAMILY HISTORY` sentence under reasonable rollup rules.
+- If a section-level surface comes back, consider **one point per Section** (no overlapping windows) — the overlap was motivated by 512-token encoder limits that a sentence-per-point indexer already avoids.
+- Bi-encoder quality check: MedTE on sentences vs. MedTE on 200-token windows for the queries the system actually gets — sentence-trained geometry should favor the former on precise queries but may lose on vague/conceptual ones.
+- `python/ingestion/mtsamples/embed_sections.py` and `scripts/create_qdrant_indices.py` still live in the repo, orphaned, as the producer and payload-indexer for the removed collection. If section-window retrieval comes back, they're the obvious starting point.
+
+**TODO — delete orphan scripts.** If this TODO is resolved with "don't bring section-window retrieval back," delete both files as part of closing it out:
+- `python/ingestion/mtsamples/embed_sections.py`
+- `scripts/create_qdrant_indices.py`
+
+They have no remaining callers in the pipeline docs or other scripts; kept on disk only because they're the natural starting point if the decision flips. Remove when the decision lands the other way.

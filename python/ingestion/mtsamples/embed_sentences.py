@@ -71,6 +71,7 @@ DOCS_DIR = REPO / "data" / "mtsamples_docs"
 
 TEI_URL = os.environ.get("TEI_URL", "http://localhost:8080")
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
+QDRANT_GRPC_PORT = int(os.environ.get("QDRANT_GRPC_PORT", "6334"))
 COLLECTION = "mtsamples_sentences"
 
 # Stable-ids namespace so chunk_id -> point id is deterministic across runs.
@@ -184,7 +185,9 @@ _WID: str | None = None
 def _init_worker(tei_url: str, qdrant_url: str) -> None:
     global _SESSION, _QDRANT, _TEI_URL, _WID
     _SESSION = requests.Session()
-    _QDRANT = QdrantClient(url=qdrant_url, timeout=120)
+    _QDRANT = QdrantClient(
+        url=qdrant_url, prefer_grpc=True, grpc_port=QDRANT_GRPC_PORT, timeout=120,
+    )
     _TEI_URL = tei_url
     _WID = f"{os.getpid()}/{uuid.uuid4().hex[:6]}"
     print(f"[worker {_WID}] http+qdrant sessions ready", flush=True)
@@ -283,7 +286,9 @@ def main() -> None:
     dim = _tei_dim(args.tei_url)
     print(f"  TEI vector dim = {dim}", flush=True)
 
-    client = QdrantClient(url=args.qdrant_url, timeout=120)
+    client = QdrantClient(
+        url=args.qdrant_url, prefer_grpc=True, grpc_port=QDRANT_GRPC_PORT, timeout=120,
+    )
     if args.recreate and client.collection_exists(COLLECTION):
         client.delete_collection(COLLECTION)
         print(f"dropped existing collection {COLLECTION!r}", flush=True)

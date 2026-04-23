@@ -45,8 +45,35 @@ services:
               count: all
               capabilities: [gpu]
 
+  # BioLORD-2023: UMLS-synonymy-trained BERT encoder for semantic entity
+  # linking. Same TEI image as MedTE so we get mean pooling + FP16 kernels
+  # out of the box. Used by build_biolord_concept_index.py and
+  # link_entities_to_cui_biolord.py — an apples-to-apples dense alternative
+  # to the lexical linker in step 11.
+  biolord:
+    image: ghcr.io/huggingface/text-embeddings-inference:89-latest
+    ports:
+      - "8081:80"
+    volumes:
+      - biolord_cache:/data
+    environment:
+      - HF_HOME=/data
+    command:
+      - --model-id=FremyCompany/BioLORD-2023
+      - --pooling=mean
+      - --max-batch-tokens=65536
+      - --max-client-batch-size=1024
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
 volumes:
   qdrant_data:
   neo4j_data:
   neo4j_logs:
   medte_cache:
+  biolord_cache:

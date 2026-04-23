@@ -1,12 +1,12 @@
 # Ingestion pipeline
 
-End-to-end steps for building the MTSamples section-embedding collection in Qdrant and the UMLS knowledge graph in Neo4j.
+End-to-end steps for building the MTSamples sentence-embedding collection in Qdrant and the UMLS knowledge graph in Neo4j.
 
 ## Pipeline overview
 
 1. **Parse MTSamples** — split each transcription by section headers (`CHIEF COMPLAINT:`, `HISTORY OF PRESENT ILLNESS:`, `ASSESSMENT AND PLAN:`, etc.). Section-aware chunking matters for clinical text — don't blindly split on 512 tokens.
-2. **Chunk within sections** (e.g. 200–400 tokens, small overlap). Assign each a stable `chunk_id` (UUID or `{doc_id}:{section}:{i}`).
-3. **Embed with MedTE and upsert to Qdrant** — put `chunk_id`, `doc_id`, `specialty`, and `section` in the payload.
+2. **Sentence-chunk within sections** (Stanza clinical tokenizer). Each sentence gets a stable `chunk_id` and carries the set of UMLS CUIs/TUIs mentioned in it.
+3. **Embed each sentence with MedTE and upsert to Qdrant** — payload carries `chunk_id`, `section_chunk_id`, `doc_id`, `specialty`, `section_type`, CUIs, TUIs, and surface forms for index-only filtering before any vector search.
 
 ## Prerequisites
 
@@ -240,7 +240,7 @@ Expected on MTSamples: **~119K of 121K entities linked (~98%)**, 100% of linked 
 python python/ingestion/mtsamples/export_entity_cui_lexical.py
 ```
 
-Step 11 resolves entities lexically — exact `Atom.str_norm` match plus a Lucene fulltext fallback on `concept_name_fts`. To make it easy to A/B against a future **semantic** variant (e.g. SapBERT / MedTE nearest-neighbor over Concept name embeddings), this step dumps one JSONL line per unique `expanded_text` with the CUI that the lexical pipeline picked:
+Step 11 resolves entities lexically — exact `Atom.str_norm` match plus a Lucene fulltext fallback on `concept_name_fts`. To make it easy to A/B against a future **semantic** variant (e.g. BioLORD-2023 nearest-neighbor over Concept name embeddings), this step dumps one JSONL line per unique `expanded_text` with the CUI that the lexical pipeline picked:
 
 ```json
 {"text": "acute myocardial infarction", "cui": "C0155626"}
@@ -291,45 +291,59 @@ Embeds each sentence chunk (produced by step 13) via MedTE/TEI and upserts one Q
 
 Expected on MTSamples: **~83K sentences embedded + upserted in ~16s wall**. Collection is configured with `cosine` distance and `indexing_threshold=100` so segments get indexed promptly (default would leave small segments unindexed, falling back to brute-force search).
 
-### 15. Embed section text into Qdrant
-
-Windows each `Section` into sentence packs of ≤200 tokens with 10% overlap, embeds every window by POSTing batches of up to 64 texts to the MedTE TEI service on `localhost:8080`, and upserts the vectors into the `mtsamples_sections` Qdrant collection. Parallelism is via `dask.bag.map_partitions` — each of the default 16 worker processes owns its own HTTP session and local tokenizer (used only for counting tokens during packing; the GPU-resident TEI container does all the encoding).
-
-```bash
-# Requires qdrant + medte services from `docker compose up -d`.
-python python/ingestion/mtsamples/embed_sections.py [--workers 16] [--recreate]
-```
-
-Point ids are `uuid5(chunk_id)` so re-runs are idempotent. Each Qdrant point's payload carries `chunk_id`, `parent_chunk_id`, `window_index`/`window_count`, `doc_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `alt_specialties`, `doctype_cui`, `sample_name`, `keywords`, and the windowed `text`. Collection dim and distance (cosine) are inferred from TEI's `/embed` response on startup. The collection is created with `optimizers.indexing_threshold=100` — Qdrant's default (~20k per segment) would otherwise leave every segment unindexed at this scale, falling back to brute-force search on every query. End state after a full run: 2,357 docs → **22,824** section-window points (768-d cosine).
-
-#### Retrieval sanity check
-
-Instruction-style query `"Retrieve all patients diagnosed with Lymphoblastic Leukemia"` against the dedup'd collection, top-50:
-
-- **37 unique docs** among the 50 section hits (up from 23 pre-dedupe — cross-filed copies no longer pad the ranking).
-- **Rank 1 @ 0.688**: `Antibiotic Therapy Consult` (doc 2175) `FAMILY HISTORY` — enumerates leukemia diagnoses in relatives, so the lexical overlap outranks the actual index-case notes. This is the retrieval failure mode worth knowing about: a bi-encoder without instruction tuning can't tell "patient was diagnosed with X" from "patient's relative was diagnosed with X".
-- **Rank 2 @ 0.613**: the target `Lymphoblastic Leukemia - Consult` (doc 2004) `ASSESSMENT`. The same note re-surfaces 6 more times in the top-50 on different sections (`CHIEF COMPLAINT`, three `HISTORY OF PRESENT ILLNESS` windows, `LABORATORY DATA`, `FAMILY HISTORY`) — legitimate multi-section retrieval of one doc rather than cross-filed duplicates.
-- Remaining hits are clinically adjacent: `Removal of Venous Port` (0.599), `Aplastic Anemia Followup`, `Non-Hodgkin lymphoma Followup`, `Polycythemia Vera Followup`, `Leiomyosarcoma`, `MediPort Placement` / `Ommaya reservoir` (chemo access), `Astrocytoma`, `T-Cell Lymphoma Consult`, `Posttransplant Lymphoproliferative Disorder`, and a couple of general discharge summaries.
-
-Takeaways: (1) MedTE + mean pooling retrieves a clinically coherent oncology neighborhood (leukemia → related heme/onc consults → chemo access devices). (2) Instruction-style query phrasing and the family-history-vs-index-case distinction both trip the encoder — the top hit being a family-history surface match is expected bi-encoder behavior; a reranker (cross-encoder) or an instruction-tuned embedder (`intfloat/e5-*`, BGE) would be needed to fix it. (3) Post-dedupe the top-k now surfaces genuinely distinct clinical neighbors instead of near-identical cross-filings — compare to the pre-dedupe run where the target doc occupied ~half of the top-50 as four cross-filed copies.
-
-### 16. Create Qdrant payload indexes
-
-```bash
-python scripts/create_qdrant_indices.py
-```
-
-Idempotent. Ensures `indexing_threshold=100` (matches what `embed_sections.py` sets on create, so re-asserts the value against any pre-existing collection), and creates payload indexes on the fields we filter by:
-
-- keyword: `parent_chunk_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `doctype_cui`, `sample_name`
-- integer: `doc_id`, `window_index`, `window_count`
-
-Without these, filters like `doc_id == 2306` or `specialty == "Nephrology"` are O(n) scans over 22K payloads on every query. Re-run whenever a new filterable field is introduced; existing indexes are a no-op.
-
-### 17. Create Neo4j constraints, indexes, and tier labels
+### 15. Create Neo4j constraints, indexes, and tier labels
 
 ```bash
 bash scripts/create_neo4j_indices.sh
 ```
 
 `scripts/load_neo4j.sh` calls this automatically at the end of the bulk-import step, so you don't need to run it again after a fresh load. Run it standalone when you want to re-assert the schema without re-importing — e.g. after restoring from the `neo4j_data.tar.zst` snapshot. Creates uniqueness constraints (`Concept.cui`, `Atom.aui`, `SemanticType.tui`, `Source.sab`), a range index on `(Atom.sab, Atom.code)` and `Concept.name`, full-text indexes `concept_name_fts` and `atom_str_fts`, and applies the four `:ClinicalCore` / `:ClinicalSupport` / `:ClinicalDiscipline` / `:Peripheral` tier labels.
+
+### 16. (Experimental) Build the BioLORD-2023 UMLS Concept index
+
+Two interchangeable variants — both write to the same `umls_concepts_biolord` Qdrant collection with the same `uuid5(cui)` point ids, so one can pick up where the other left off via the shared `data/biolord_concept_index.state` resume file.
+
+**Variant A — TEI-backed (default, matches the rest of the pipeline):**
+
+```bash
+docker compose up -d biolord qdrant neo4j
+python python/ingestion/umls/build_biolord_concept_index.py [--workers 8] [--batch 64] [--resume]
+```
+
+Embeds every `Concept.name` via BioLORD-2023 (served by a second TEI container on `localhost:8081`, `--pooling=mean` — BioLORD is a sentence-transformers model trained with mean-pooled + L2-normalized vectors, same as MedTE). Payload: `{cui, name}`. Neo4j is streamed in `--page-size` (default 20,000) keyset-paginated pages on `cui ASC`; each page is **LPT-first size-balanced** across `--workers` mp.Pool processes (one biolord HTTP session + one Qdrant client per worker), and within each shard items are **length-sorted descending before batching** so padding-to-longest waste in the forward pass is near-zero (same pattern as step 7's Stanza NER).
+
+Sweep on L4 (8 workers, 40 K-concept sample, LPT-balanced shards) picked **8 × batch 64 at ~2,000/s** as the knee — beats 16×64 because extra workers only add TEI-queue contention, beats batch 128 by <1%, beats batch 256 by ~2× (at 256 TEI's dynamic batcher can't re-pack effectively). The script has a 30-retry / 8 s-max-delay backoff on HTTP 429 so transient saturation never kills the run.
+
+**Variant B — TEI-free, local GPU (faster for one-time full rebuilds):**
+
+```bash
+docker compose stop biolord        # free VRAM for torch
+docker compose up -d qdrant neo4j
+python python/ingestion/umls/build_biolord_concept_index_local.py [--batch 1024] [--resume] [--half]
+```
+
+Loads BioLORD directly via `sentence-transformers` on the host GPU, streams concepts page-by-page from Neo4j, length-sorts each page, runs a single chunked forward pass at `--batch`, and upserts to Qdrant over **gRPC** (port 6334). No HTTP/JSON round-trips between Python and the embedder — every vector stays on-device until the batch is done, which typically gives 2–3× the TEI-variant throughput on the same hardware. Requires the venv's CUDA torch (already present for step 7's Stanza GPU path; `python -c 'import torch; print(torch.cuda.is_available())'`). `--half` casts the model to fp16 for another ~2× at a tiny numeric delta (BioLORD was trained fp32).
+
+Both variants persist the last successfully-upserted CUI to `data/biolord_concept_index.state` after every page, so `--resume` is safe to re-run across variants. One-time cost on MTSamples-scale UMLS (~3.3 M concepts × 768-d): variant A ~30 min, variant B ~10–15 min with `--half`. The collection is the search side of the comparison in step 17.
+
+### 17. (Experimental) Link entities via BioLORD nearest-neighbor — diff against the lexical baseline
+
+```bash
+docker compose up -d biolord qdrant
+python python/ingestion/mtsamples/link_entities_to_cui_biolord.py [--workers 16] [--batch 32] [--min-score 0.7]
+```
+
+Semantic counterpart to step 11. Dedups the same universe of unique `expanded_text` values across `data/mtsamples_docs/*.json`, embeds each via BioLORD on `:8081`, and does a top-1 nearest-neighbor search against `umls_concepts_biolord` (built in step 16). Writes `data/entity_cui_biolord.jsonl`:
+
+```json
+{"text": "subpectoral pocket", "cui": "C0229909", "cui_name": "Pectoral region structure", "score": 0.81}
+```
+
+The `text` + `cui` columns diff directly against `data/entity_cui_lexical.jsonl` (step 12), so the delta between the two linkers is a one-line `join`. Below-threshold hits (cosine < `--min-score`) are written with `cui: ""` so the snapshot stays a complete coverage map rather than only the matches.
+
+**Why we expect BioLORD to win where lexical loses.** The lexical linker scores candidate Concepts by BM25-style token overlap on the entity string in isolation, so `"copious irrigation"` resolves to `Copious` (the one-word finding literally named that) instead of the `Irrigation` procedure, and `"subpectoral pocket"` resolves to `Periodontal Pocket` on the `pocket` token even though the sentence is about chest-wall anatomy. BioLORD-2023 is fine-tuned on UMLS synonym and definition contrastive pairs, so semantically related Concepts cluster in the embedding space and lexically-similar-but-semantically-distant ones do not — the nearest neighbor of `"subpectoral pocket"` sits in the pectoral-region cluster, not the dental one.
+
+**Scope of v1.**
+- Snapshot-only — does not write back into per-doc JSONs. Audit the diff before deciding whether to rewire the main pipeline (steps 13–14 still consume step 11's lexical CUIs in-place).
+- Embeds each entity in isolation for apples-to-apples comparison with the lexical linker. A follow-up can pass the enclosing sentence as context for additional lift on polysemous mentions.
+- TUIs are not re-fetched; derive them from the resolved CUIs via the same `HAS_SEMTYPE` pass as step 11 phase 4 if/when needed.

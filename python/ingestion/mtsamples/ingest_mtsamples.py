@@ -37,7 +37,7 @@ def main():
     model = SentenceTransformer(EMBED_MODEL)
     dim = model.get_sentence_embedding_dimension()
 
-    client = QdrantClient(url=QDRANT_URL)
+    client = QdrantClient(url=QDRANT_URL, prefer_grpc=True, grpc_port=6334)
 
     # Recreate collection
     if client.collection_exists(COLLECTION):
