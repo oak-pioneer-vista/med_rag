@@ -234,7 +234,21 @@ Fields written per entity:
 
 Expected on MTSamples: **~119K of 121K entities linked (~98%)**, 100% of linked entities carry ≥1 TUI. Top semantic types across the corpus: **T033 Finding (16.6K), T061 Therapeutic/Preventive Procedure (13.8K), T047 Disease or Syndrome (12.6K), T074 Medical Device (9.9K), T121 Pharmacologic Substance (8.9K), T184 Sign or Symptom (8.3K)** — i.e. the distribution a clinical corpus should produce.
 
-### 12. Sentence-chunk sections + tag each sentence with linked entity sets
+### 12. Snapshot the lexical entity→CUI map for later comparison
+
+```bash
+python python/ingestion/mtsamples/export_entity_cui_lexical.py
+```
+
+Step 11 resolves entities lexically — exact `Atom.str_norm` match plus a Lucene fulltext fallback on `concept_name_fts`. To make it easy to A/B against a future **semantic** variant (e.g. SapBERT / MedTE nearest-neighbor over Concept name embeddings), this step dumps one JSONL line per unique `expanded_text` with the CUI that the lexical pipeline picked:
+
+```json
+{"text": "acute myocardial infarction", "cui": "C0155626"}
+```
+
+Unresolved entities are preserved with `cui: ""` so the snapshot is a complete coverage map, not just the hits. Expected on MTSamples: **49,390 unique entities → 48,102 linked / 1,288 unlinked** written to `data/entity_cui_lexical.jsonl` in ~1s. Re-run the same export after swapping in a semantic linker and diff the two files to see exactly which entities move.
+
+### 13. Sentence-chunk sections + tag each sentence with linked entity sets
 
 ```bash
 python python/ingestion/mtsamples/chunk_sentences.py [--workers 8] [--batch 128]
@@ -252,14 +266,14 @@ Parallelism is `mp.Pool` with `spawn` start method (same pattern as step 7). Eac
 
 Expected on MTSamples: **~83K sentences across 18K sections in ~20s wall on L4 (8 workers, batch=128)**; ~74% of sentences carry ≥1 CUI hit. Stanza catches ~800 more sentence boundaries than the naive regex, mostly in operative-note comma-joined clauses.
 
-### 13. Embed sentence-level chunks into Qdrant
+### 14. Embed sentence-level chunks into Qdrant
 
 ```bash
 docker compose up -d medte qdrant
 python python/ingestion/mtsamples/embed_sentences.py [--workers 16] [--batch 32] [--recreate]
 ```
 
-Embeds each sentence chunk (produced by step 12) via MedTE/TEI and upserts one Qdrant point per sentence into the `mtsamples_sentences` collection. Point id is `uuid5(chunk_id)` so re-runs are idempotent. Parallelism is `mp.Pool` — each worker owns an HTTP session + Qdrant client; TEI does server-side dynamic batching across concurrent worker requests.
+Embeds each sentence chunk (produced by step 13) via MedTE/TEI and upserts one Qdrant point per sentence into the `mtsamples_sentences` collection. Point id is `uuid5(chunk_id)` so re-runs are idempotent. Parallelism is `mp.Pool` — each worker owns an HTTP session + Qdrant client; TEI does server-side dynamic batching across concurrent worker requests.
 
 **Payload carries full provenance** (all fields payload-indexed): `chunk_id`, `section_chunk_id`, `doc_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `alt_specialty_cuis`, `doctype_cui`, `cuis`, `tuis`, `surface_forms`, `text`. Enables index-only filters like *"sentences in General Medicine notes, HPI section, mentioning C0001175"* before any vector search.
 
@@ -277,7 +291,7 @@ Embeds each sentence chunk (produced by step 12) via MedTE/TEI and upserts one Q
 
 Expected on MTSamples: **~83K sentences embedded + upserted in ~16s wall**. Collection is configured with `cosine` distance and `indexing_threshold=100` so segments get indexed promptly (default would leave small segments unindexed, falling back to brute-force search).
 
-### 14. Embed section text into Qdrant
+### 15. Embed section text into Qdrant
 
 Windows each `Section` into sentence packs of ≤200 tokens with 10% overlap, embeds every window by POSTing batches of up to 64 texts to the MedTE TEI service on `localhost:8080`, and upserts the vectors into the `mtsamples_sections` Qdrant collection. Parallelism is via `dask.bag.map_partitions` — each of the default 16 worker processes owns its own HTTP session and local tokenizer (used only for counting tokens during packing; the GPU-resident TEI container does all the encoding).
 
@@ -299,7 +313,7 @@ Instruction-style query `"Retrieve all patients diagnosed with Lymphoblastic Leu
 
 Takeaways: (1) MedTE + mean pooling retrieves a clinically coherent oncology neighborhood (leukemia → related heme/onc consults → chemo access devices). (2) Instruction-style query phrasing and the family-history-vs-index-case distinction both trip the encoder — the top hit being a family-history surface match is expected bi-encoder behavior; a reranker (cross-encoder) or an instruction-tuned embedder (`intfloat/e5-*`, BGE) would be needed to fix it. (3) Post-dedupe the top-k now surfaces genuinely distinct clinical neighbors instead of near-identical cross-filings — compare to the pre-dedupe run where the target doc occupied ~half of the top-50 as four cross-filed copies.
 
-### 15. Create Qdrant payload indexes
+### 16. Create Qdrant payload indexes
 
 ```bash
 python scripts/create_qdrant_indices.py
@@ -312,7 +326,7 @@ Idempotent. Ensures `indexing_threshold=100` (matches what `embed_sections.py` s
 
 Without these, filters like `doc_id == 2306` or `specialty == "Nephrology"` are O(n) scans over 22K payloads on every query. Re-run whenever a new filterable field is introduced; existing indexes are a no-op.
 
-### 16. Create Neo4j constraints, indexes, and tier labels
+### 17. Create Neo4j constraints, indexes, and tier labels
 
 ```bash
 bash scripts/create_neo4j_indices.sh
