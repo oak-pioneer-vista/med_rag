@@ -204,18 +204,25 @@ Genuine sense ambiguity (CD, IC, …) survives both passes — exactly what we w
 
 **Takeaway.** "Abbrev X resolved to N different expansions" isn't a single phenomenon — it's true ambiguity and surface-string drift mixed together. Sampling a handful and printing originating doc-ids is enough to separate them at a glance (different concepts cluster apart; cosmetic variants look near-identical). Worth running ad-hoc whenever the abbrev resolver design changes, even if the audit script doesn't live in the persistent pipeline.
 
-## TODO: lexical vs. semantic linking after entity resolution
+## TODO: merge lexical + BioLORD entity linkers
 
-**Status.** Open question. Decide before wiring the post-resolution step.
+**Status.** Both stages now wired and producing diffable snapshots — the original "decide before wiring" framing is obsolete. **Lexical (step 11, `link_entities_to_cui.py`)** is the production path: exact `Atom.str_norm` + `concept_name_fts` fallback; its CUIs flow into per-doc JSONs and downstream into the sentence embeddings (steps 13–14). **Semantic (steps 16–17, experimental)** is snapshot-only: `link_entities_to_cui_biolord.py` emits `data/entity_cui_biolord.jsonl`, which diffs line-for-line on `text` against step 12's `data/entity_cui_lexical.jsonl`. Open question: what merge rule governs how the two compose in the main pipeline.
 
-**Problem.** Once a mention is resolved to a CUI (see "Entity linking / grounding against UMLS in Neo4j"), the next stage — joining that CUI to other concepts, expansions, or passages — can be done lexically (graph traversal + fulltext over `Atom`/`Concept` strings) or semantically (cosine over CUI/concept embeddings). They have different failure modes and the right choice probably depends on the downstream consumer (retrieval expansion vs. graph reasoning vs. reranking).
+**Problem.** The two linkers have disjoint failure modes:
+- **Lexical loses** when BM25-style token overlap outranks meaning. Examples from step 17's prose: `"copious irrigation"` → `Copious` (the one-word finding), `"subpectoral pocket"` → `Periodontal Pocket` (matches on `pocket` despite chest-wall context).
+- **Semantic loses** on rare / misspelled surface forms, and on very short mentions where BioLORD's sentence-trained geometry goes out-of-distribution — UMLS preferred names are often 1–4 words, the same failure mode described in "Short queries against a sentence-level encoder" at the top of this file.
 
-**To weigh.**
-- **Lexical (graph-side).** Deterministic, auditable, free once UMLS is loaded. Walks `IS_A` / `RELATES` / `HAS_ATOM` for synonym + hierarchy expansion. Misses cross-vocabulary semantic neighbors that aren't connected by an explicit edge.
-- **Semantic (embedding-side).** Embed each CUI's preferred name (or pooled atom strings) once, ANN-search over the concept space. Surfaces clinically related concepts the graph doesn't connect, but adds an embedding store, an encoder choice (MedTE? a dedicated concept encoder?), and the same short-input degradation noted at the top of this file — preferred names are 1–4 words.
-- **Hybrid.** Lexical for synonym + hierarchy (where the graph is authoritative), semantic for "concepts close in meaning but not directly connected." Most likely the answer, but needs an evaluation harness to decide where the boundary sits.
+Neither dominates. A merge rule is almost certainly the answer; the work is figuring out which one and evaluating it without a hand-labeled gold set.
 
-**Decide alongside.** The linker design (above) and the negation TODO (below) — both interact with whether downstream consumers see surface strings, CUIs, or vectors.
+**Options to weigh.**
+- **Lexical-first, semantic fallback on `cui=""` tail.** Cheapest — keep step 11 authoritative and consult BioLORD only for the ~2% unlinked entities. Minimal risk to the production path, but doesn't rescue *wrong* lexical hits (like `Copious`) which are indistinguishable from correct hits downstream.
+- **Disagreement-triggered tiebreak.** Run both; when they disagree on the same `text`, apply a tiebreaker — BioLORD score threshold, section/specialty TUI prior, UMLS source-reliability (`MRRANK`). Most lift per unit complexity if the diff's disagreement rate is meaningful.
+- **Full swap to semantic.** Clean, but loses lexical's near-certainty on exact-atom hits (standardized drug names, acronyms that appear verbatim as atoms) — BioLORD's weakest case.
+- **Score fusion.** Rerank candidates from both (lexical fulltext score + BioLORD cosine, per-source calibrated). Highest ceiling, highest build cost, and needs an eval harness.
+
+**First concrete step.** `jq` or pandas join the two JSONLs on `text`; bucket rows into agree / disagree / only-lexical / only-semantic; hand-audit ~100 from each disagreement bucket to estimate per-bucket accuracy. That's the evidence a merge rule can actually be parameterized against — without it, every option above is a guess.
+
+**Decide alongside.** The negation TODO (below) — both affect whether downstream sentence-embedding / graph-join consumers see a single canonical CUI or a scored candidate set. Also the still-open *post-resolution* CUI-to-CUI expansion question (Neo4j `IS_A`/`RELATES` walks vs. BioLORD concept ANN against `umls_concepts_biolord`): same lexical-vs-semantic tradeoff, different stage of the pipeline, and the BioLORD concept index built in step 16 is already the search side of whichever path gets picked.
 
 ## TODO: negation-aware embedding
 

@@ -71,7 +71,9 @@ REPO = Path(__file__).resolve().parent.parent.parent.parent
 DOCS_DIR = REPO / "data" / "mtsamples_docs"
 LRABR_PATH = REPO / "data" / "umls" / "LRABR"
 OVERRIDE_PATH = REPO / "data" / "clinical_abbreviations_override.json"
+AUGMENT_PATH = REPO / "data" / "lrabr_augment.json"
 TEI_URL_DEFAULT = os.environ.get("TEI_URL", "http://localhost:8080")
+BIOLORD_URL_DEFAULT = os.environ.get("BIOLORD_URL", "http://localhost:8081")
 
 # 2+ char all-caps candidate, optionally mixed with digits.
 ABBREV_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9]+\b")
@@ -108,6 +110,37 @@ def parse_lrabr(path: Path) -> dict[str, list[str]]:
                 continue
             grouped.setdefault(abbrev.upper(), set()).add(expansion)
     return {k: sorted(v) for k, v in grouped.items()}
+
+
+def load_augment(path: Path) -> dict[str, list[str]]:
+    """Load {UPPER_ABBREV: [extra_expansions]} from lrabr_augment.json.
+
+    Skips underscore-prefixed keys (they're comments/metadata).
+    """
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    out: dict[str, list[str]] = {}
+    for k, v in raw.items():
+        if k.startswith("_"):
+            continue
+        if not isinstance(v, list):
+            continue
+        out[k.upper()] = [str(e) for e in v if isinstance(e, str) and e.strip()]
+    return out
+
+
+def merge_augment(lrabr: dict[str, list[str]], augment: dict[str, list[str]]) -> tuple[dict[str, list[str]], int]:
+    """Merge augment candidates into LRABR. Returns (merged_dict, n_new_candidates)."""
+    new = 0
+    for up, extras in augment.items():
+        base = set(lrabr.get(up, []))
+        for e in extras:
+            if e not in base:
+                base.add(e)
+                new += 1
+        lrabr[up] = sorted(base)
+    return lrabr, new
 
 
 def _section_text(section: dict) -> str:
@@ -152,15 +185,45 @@ def main() -> None:
     ap.add_argument("--docs", type=Path, default=DOCS_DIR)
     ap.add_argument("--lrabr", type=Path, default=LRABR_PATH)
     ap.add_argument("--override", type=Path, default=OVERRIDE_PATH)
+    ap.add_argument("--augment", type=Path, default=AUGMENT_PATH,
+                    help="JSON file adding clinical senses missing from LRABR "
+                         "(e.g. ST->ST segment). Merged into LRABR at load "
+                         "time; WSD still scores all candidates.")
     ap.add_argument("--tei-url", default=TEI_URL_DEFAULT,
-                    help=f"(default: {TEI_URL_DEFAULT})")
-    ap.add_argument("--min-score", type=float, default=0.3,
-                    help="minimum cosine similarity for LRABR picks "
-                         "(default: 0.3)")
+                    help=f"MedTE TEI endpoint (default: {TEI_URL_DEFAULT})")
+    ap.add_argument("--min-score", type=float, default=0.35,
+                    help="minimum MedTE cosine similarity for LRABR picks. "
+                         "Bumped from 0.3 to 0.35 based on the step-6 WSD "
+                         "audit: several wrong picks sat at 0.32-0.34 "
+                         "(default: 0.35)")
     ap.add_argument("--no-gazetteer", action="store_true",
                     help="skip LRABR pass (S-H + override only)")
     ap.add_argument("--no-override", action="store_true",
                     help="skip curated override pass")
+    ap.add_argument("--no-augment", action="store_true",
+                    help="skip merging lrabr_augment.json into LRABR")
+    # Ensemble gating: MedTE is primary; BioLORD is a confidence check on
+    # borderline MedTE picks. See scripts/compare_abbrev_wsd.py for the
+    # analysis that motivated this design (MedTE wins ~3:1 on real WSD
+    # disagreements; BioLORD helps as a gate on low-confidence MedTE picks).
+    ap.add_argument("--ensemble", action="store_true",
+                    help="gate borderline MedTE picks on BioLORD agreement: "
+                         "high-confidence MedTE (>= --medte-high) accepted "
+                         "unilaterally; borderline MedTE (>= --min-score) "
+                         "requires BioLORD agreement >= --biolord-low on the "
+                         "same candidate")
+    ap.add_argument("--biolord-url", default=BIOLORD_URL_DEFAULT,
+                    help=f"BioLORD TEI endpoint (default: {BIOLORD_URL_DEFAULT})")
+    ap.add_argument("--medte-high", type=float, default=0.5,
+                    help="MedTE score at or above which we bypass BioLORD "
+                         "agreement check (default: 0.5)")
+    ap.add_argument("--biolord-low", type=float, default=0.35,
+                    help="BioLORD cosine floor used only when gating "
+                         "borderline MedTE picks in --ensemble mode. "
+                         "BioLORD's narrative-to-concept cosine distribution "
+                         "is systematically lower than MedTE's, so this is "
+                         "intentionally close to --min-score, not 0.7 "
+                         "(default: 0.35)")
     args = ap.parse_args()
 
     paths = sorted(args.docs.glob("*.json"))
@@ -189,6 +252,13 @@ def main() -> None:
         n_multi = sum(1 for v in lrabr.values() if len(v) > 1)
         print(f"loaded LRABR: {len(lrabr):,} abbrevs ({n_multi:,} ambiguous)",
               flush=True)
+        if not args.no_augment:
+            augment = load_augment(args.augment)
+            if augment:
+                lrabr, n_new = merge_augment(lrabr, augment)
+                print(f"merged LRABR augment: {len(augment)} surface forms, "
+                      f"{n_new} new candidate expansions added",
+                      flush=True)
 
     # ---- Pass 1: per-section S-H + override; queue LRABR work per section.
     docs: list[tuple[Path, dict]] = []
@@ -263,44 +333,85 @@ def main() -> None:
 
         print(
             f"embedding {len(section_texts):,} section contexts and "
-            f"{len(expansion_texts):,} expansions via {args.tei_url} ...",
+            f"{len(expansion_texts):,} expansions via medte={args.tei_url}"
+            f"{' + biolord=' + args.biolord_url if args.ensemble else ''} ...",
             flush=True,
         )
         t1 = time.time()
         try:
             sec_vecs = embed_batched(section_texts, args.tei_url)
             exp_vecs = embed_batched(expansion_texts, args.tei_url)
+            if args.ensemble:
+                bio_sec_vecs = embed_batched(section_texts, args.biolord_url)
+                bio_exp_vecs = embed_batched(expansion_texts, args.biolord_url)
         except requests.RequestException as e:
             print(f"error: TEI request failed ({e}). "
-                  f"Is medte running? `docker compose up -d medte`",
+                  f"Is medte (and biolord, if --ensemble) running? "
+                  f"`docker compose up -d medte biolord`",
                   file=sys.stderr)
             sys.exit(1)
         print(f"  embeddings done in {time.time()-t1:.1f}s", flush=True)
 
         # ---- Pass 3: resolve each LRABR occurrence by cosine sim against
         # its parent section's context vector.
+        # In --ensemble mode MedTE is primary, BioLORD is a confidence gate:
+        #   - med_score >= --medte-high            -> accept (unilateral)
+        #   - --min-score <= med_score < --medte-high AND
+        #       bio_score >= --biolord-low AND med_pick == bio_pick -> accept (agreed)
+        #   - otherwise                            -> skip
         n_resolved = 0
-        n_below_threshold = 0
+        n_below_threshold = 0          # MedTE alone below --min-score
+        n_ensemble_disagree = 0        # borderline MedTE, no BioLORD concurrence
+        n_unilateral = 0               # --medte-high bypass
+        n_agreed = 0                   # ensemble agreement accept
         for di, si, tok, up in work:
             exps = lrabr[up]
+            exp_row_ids = np.array([unique_expansions[e] for e in exps])
             sv = sec_vecs[section_key_to_row[(di, si)]]
-            ev = exp_vecs[np.array([unique_expansions[e] for e in exps])]
+            ev = exp_vecs[exp_row_ids]
             sims = ev @ sv
             best = int(np.argmax(sims))
             score = float(sims[best])
             if score < args.min_score:
                 n_below_threshold += 1
                 continue
+
+            if args.ensemble and score < args.medte_high:
+                bsv = bio_sec_vecs[section_key_to_row[(di, si)]]
+                bev = bio_exp_vecs[exp_row_ids]
+                bio_sims = bev @ bsv
+                bio_best = int(np.argmax(bio_sims))
+                bio_score = float(bio_sims[bio_best])
+                if bio_best != best or bio_score < args.biolord_low:
+                    n_ensemble_disagree += 1
+                    continue
+                n_agreed += 1
+            elif args.ensemble:
+                n_unilateral += 1
+
             sec = docs[di][1]["sections"][si]
             sec["abbreviations"][tok] = exps[best]
             sec["abbreviations_source"][tok] = "lrabr"
             sec["abbreviations_score"][tok] = round(score, 4)
             n_resolved += 1
-        print(
-            f"resolved {n_resolved:,} by cosine, "
-            f"skipped {n_below_threshold:,} below --min-score={args.min_score}",
-            flush=True,
-        )
+
+        if args.ensemble:
+            print(
+                f"resolved {n_resolved:,} by cosine "
+                f"({n_unilateral:,} MedTE unilateral >= {args.medte_high}, "
+                f"{n_agreed:,} MedTE+BioLORD agreed); "
+                f"skipped {n_below_threshold:,} below MedTE --min-score="
+                f"{args.min_score}, {n_ensemble_disagree:,} rejected by "
+                f"ensemble gate (BioLORD disagreed or below "
+                f"--biolord-low={args.biolord_low})",
+                flush=True,
+            )
+        else:
+            print(
+                f"resolved {n_resolved:,} by cosine, "
+                f"skipped {n_below_threshold:,} below --min-score={args.min_score}",
+                flush=True,
+            )
 
     # ---- Write back. Tally section-level stats.
     n_sections_with_abbrev = 0

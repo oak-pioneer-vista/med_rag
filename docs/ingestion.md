@@ -124,7 +124,7 @@ python python/ingestion/mtsamples/parse_mtsamples.py [--workers 16]
 
 Result: **2,357 per-doc JSONs** under `data/mtsamples_docs/{doc_id:04d}.json`. Each doc carries `doc_id`, `specialty`, `specialty_cui`, `doctype_cui` (explicit mapping or heuristic rule), `sample_name`, merged `keywords`, `alt_specialties` (list of `{specialty, specialty_cui, doctype_cui}` from the dropped cross-filings — every entry has at least one CUI populated), and a list of `Section` records (`chunk_id`, `section_type`, `text`, plus placeholders for `embedding` and `entities` populated downstream). `doctype_cui` is set on 1,634/2,357 docs (specialties without an explicit mapping in `data/doctype_cui.json` and no matching heading rule get `""`).
 
-### 6. Build per-section abbreviation maps (Schwartz-Hearst + override + LRABR + MedTE WSD)
+### 6. Build per-section abbreviation maps (Schwartz-Hearst + override + LRABR-augmented + MedTE WSD [+ optional BioLORD ensemble])
 
 Three-stage resolution **per Section**, not per doc. Each Section gets `abbreviations`, `abbreviations_source` (`sh`/`override`/`lrabr`), and `abbreviations_score` (1.0 for S-H and override, cosine similarity for LRABR) written into the per-doc JSON. The same surface form can resolve to different expansions in different sections of the same doc — useful when one note mixes topics (e.g. `MS` could mean mitral stenosis in `PROCEDURE` and multiple sclerosis in `HPI` of the same doc; the section text is what disambiguates).
 
@@ -132,16 +132,32 @@ Three-stage resolution **per Section**, not per doc. Each Section gets `abbrevia
 # prereqs: MedTE TEI up, LRABR staged, parse_mtsamples already run
 docker compose up -d medte
 python python/ingestion/umls/download_specialist_lexicon.py
-python python/ingestion/mtsamples/build_abbreviations.py [--min-score 0.3]
+python python/ingestion/mtsamples/build_abbreviations.py [--min-score 0.35] [--ensemble]
 ```
 
 **1. Schwartz-Hearst** over each section's text alone. Most clinical notes introduce abbreviations once at the top and reuse them across sections, so per-section S-H gives many fewer hits than the per-doc variant — but the hits that remain are still the highest-confidence signal because the definition is evidence-in-section.
 
 **2. Curated clinical override** (`data/clinical_abbreviations_override.json`) — a ~60-entry hand-picked list for clinical-canon abbreviations (IV, BUN, CT, MRI, EKG, ABCD, AICD, PTT, PSA, …) whose canonical expansion is overwhelmingly unambiguous in clinical notes regardless of section context. Wins over LRABR; source tag `override`; no embedding check needed.
 
-**3. LRABR gazetteer + MedTE WSD** for everything else — NLM's SPECIALIST Lexicon LRABR (~62K abbrevs, ~38K with multiple senses) is purpose-built and far cleaner than deriving AB/ACR atoms from MRCONSO (which is dominated by chemo-protocol shorthand and gene symbols). Every LRABR hit is gated by cosine similarity between **THIS SECTION's text** and each candidate expansion via MedTE/TEI; winner must clear `--min-score` (default 0.3). Per-section context is shorter than the joined-doc context, which is the point — when a doc spans multiple topics the WSD shouldn't average them.
+**3. LRABR gazetteer (augmented) + MedTE WSD** for everything else — NLM's SPECIALIST Lexicon LRABR (~62K abbrevs, ~38K with multiple senses) is purpose-built and far cleaner than deriving AB/ACR atoms from MRCONSO (which is dominated by chemo-protocol shorthand and gene symbols). LRABR is **merged with `data/lrabr_augment.json`** at load time (e.g. `ST` → `ST segment`, `CN` → `cranial nerve` — clinical senses that MRCONSO-derived LRABR omits), so the WSD has the right candidate to pick from. Every LRABR hit is gated by cosine similarity between **THIS SECTION's text** and each candidate expansion via MedTE/TEI; winner must clear `--min-score` (default **0.35**, bumped from 0.3 based on the WSD audit in `scripts/compare_abbrev_wsd.py` — several wrong MedTE picks sat at 0.32-0.34). Per-section context is shorter than the joined-doc context, which is the point — when a doc spans multiple topics the WSD shouldn't average them.
 
-Resolution stats on MTSamples: **3,634/18,336 sections (~20%)** carry ≥1 abbreviation; **135 S-H + 2,799 override + 3,327 LRABR** per-section assignments; ~3,861 LRABR candidates skipped below threshold. Embedding pass is small (~3,700 unique section contexts + ~14,400 unique expansions, ~8s on the local TEI service). Compared to the previous per-doc design (1,500 docs / 2,357 with ≥1 abbrev; 143 S-H, 2,392 override, 1,542 LRABR): S-H is ~unchanged (most parenthetical intros sit in the same section as their abbrev), override and LRABR roughly double because the dedup key is now per-section instead of per-doc — the same `IV` or `CT` appearing in three sections of one doc now resolves three times, with WSD scored against each section's local context.
+**Optional `--ensemble` gate (BioLORD as confidence check).** Requires `docker compose up -d biolord`. MedTE is primary; BioLORD is used only to gate borderline MedTE picks:
+
+- `med_score >= --medte-high` (default 0.5) → **unilateral accept** (BioLORD not consulted).
+- `--min-score <= med_score < --medte-high` → **accept only if** BioLORD picks the same candidate with `bio_score >= --biolord-low` (default 0.35).
+- Otherwise → skip.
+
+BioLORD's cosine floor for this task is intentionally close to MedTE's, not the 0.7 used for concept-to-concept linking in step 17 — narrative-to-concept scores live in a much lower distribution for BioLORD because it was trained on concept↔synonym pairs, not long-prose-to-concept alignment (see `scripts/compare_abbrev_wsd.py` for the full analysis).
+
+Expected on MTSamples (each config overwrites the per-doc JSONs; cascade step 8+ to propagate):
+
+| config | LRABR picks | sections w/ abbrev |
+|---|---:|---:|
+| legacy (`--min-score 0.3`, no augment, no ensemble) | 3,327 | 3,634 |
+| **new default** (augment + `--min-score 0.35`) | **2,609** | **3,366** |
+| `--ensemble` (precision-oriented, opt-in) | 1,171 | 2,782 |
+
+S-H (135) and override (2,799) are the same across all three configs. The ~718 picks removed by the 0.35 threshold are the noise band of weak MedTE hits; the additional ~1,438 filtered by `--ensemble` are borderline MedTE picks where BioLORD withholds concurrence. `--ensemble` is opt-in for users who prioritize precision over coverage; the default behavior is MedTE-only with the bumped threshold plus the augment.
 
 ### 7. Extract per-section entities with spans (Stanza i2b2 NER)
 
@@ -347,3 +363,29 @@ The `text` + `cui` columns diff directly against `data/entity_cui_lexical.jsonl`
 - Snapshot-only — does not write back into per-doc JSONs. Audit the diff before deciding whether to rewire the main pipeline (steps 13–14 still consume step 11's lexical CUIs in-place).
 - Embeds each entity in isolation for apples-to-apples comparison with the lexical linker. A follow-up can pass the enclosing sentence as context for additional lift on polysemous mentions.
 - TUIs are not re-fetched; derive them from the resolved CUIs via the same `HAS_SEMTYPE` pass as step 11 phase 4 if/when needed.
+
+### 18. (Experimental) Hybrid linker — exact `Atom.str_norm` + BioLORD NN fallback
+
+```bash
+docker compose up -d biolord qdrant neo4j
+python python/ingestion/mtsamples/link_entities_to_cui_hybrid.py [--workers 8] [--batch 64] [--min-score 0.7]
+```
+
+Production-shape linker that combines the best of steps 11 and 17, informed by the diff between them:
+
+1. **Phase A** — exact `Atom.str_norm` via Neo4j (same query as step 11 phase 2). Strictly wins on abbreviations and short polysemous surfaces (`tah/bso`, `djd`, `hjr`, `ca`, `stylet`, `cold`) because BioLORD's embedding space doesn't co-locate abbreviations with their expansions.
+2. **Phase B** — BioLORD-2023 nearest-neighbor via `umls_concepts_biolord` (same search as step 17) on the residual hashes. Beats Lucene fulltext on descriptive phrases whose token overlap misleads BM25: `"copious irrigation"` → `Therapeutic Irrigation` instead of the one-word `Copious` finding, `"sentinel node dissection"` → `Excision of sentinel lymph node` instead of a weaker lex hit.
+3. **Phase C** — TUI enrichment via Neo4j, identical to step 11 phase 4.
+
+Output: `data/entity_cui_hybrid.jsonl`:
+
+```json
+{"text": "copious irrigation", "cui": "C2936738", "cui_name": "Therapeutic Irrigation",
+ "cui_match": "biolord/0.864", "score": 0.864, "tuis": ["T061"], "tui_names": ["Therapeutic or Preventive Procedure"]}
+```
+
+The `cui_match` field records provenance (`"exact"` vs `"biolord/<cosine>"`) so downstream consumers can filter on confidence. Below-threshold hits are preserved with `cui: ""` so the snapshot stays a complete coverage map.
+
+Expected on MTSamples (L4, 8 workers × batch 64, gRPC to Qdrant): **49,390 unique entities; 10,900 exact (22.1%) + 34,838 BioLORD ≥ 0.7 (70.5%) + 3,652 unresolved; ~34s wall including TUI pass**. Compared to step 11's lexical-only baseline at 48,102 linked (97.4%), the hybrid trades ~4.8pp of coverage for the precision wins on descriptive phrases — most of the gap is low-confidence Lucene fulltext hits (score ≥ 5) where BioLORD's best neighbor sits below 0.7 and the match is probably spurious. Drop `--min-score 0.6` to narrow the gap if coverage matters more than precision.
+
+**Next step (not implemented in v1).** This linker is snapshot-only; a companion writeback pass would lift each per-section `entity.cui` from `data/entity_cui_hybrid.jsonl` back into `data/mtsamples_docs/*.json`, replacing step 11's lexical assignments and triggering a rebuild of steps 13–14 (sentence payloads in Qdrant). Do that once the diff against the lexical baseline has been spot-audited.
