@@ -23,9 +23,10 @@ services:
       - NEO4J_PLUGINS=["apoc"]
 
   # HuggingFace Text Embeddings Inference serving MedTE on the host GPU.
-  # Image tag `89-latest` targets CUDA compute capability 8.9 (NVIDIA L4/Ada).
+  # Image tag `turing-latest` targets CUDA compute capability 7.5 (NVIDIA T4/Turing).
+  # Swap to `89-latest` for L4/Ada (CC 8.9), or another tag matching your GPU.
   medte:
-    image: ghcr.io/huggingface/text-embeddings-inference:89-latest
+    image: ghcr.io/huggingface/text-embeddings-inference:turing-latest
     ports:
       - "8080:80"
     volumes:
@@ -51,7 +52,7 @@ services:
   # link_entities_to_cui_biolord.py — an apples-to-apples dense alternative
   # to the lexical linker in step 11.
   biolord:
-    image: ghcr.io/huggingface/text-embeddings-inference:89-latest
+    image: ghcr.io/huggingface/text-embeddings-inference:turing-latest
     ports:
       - "8081:80"
     volumes:

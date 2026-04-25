@@ -102,7 +102,15 @@ Imported into Neo4j: ~3.3M `Concept` nodes, ~9M `Atom` nodes (one per MRCONSO ro
 
 A pre-built snapshot of the imported store is at `gs://med_rag/neo4j_processed/neo4j_data.tar.zst` (~900 MB) — restore by extracting into the `med_rag_neo4j_data` Docker volume with neo4j stopped.
 
-### 4. Clean MTSamples (drop empty transcripts, dedupe cross-filings)
+### 4. Create Neo4j constraints, indexes, and tier labels
+
+```bash
+bash scripts/create_neo4j_indices.sh
+```
+
+`scripts/load_neo4j.sh` calls this automatically at the end of the bulk-import step, so you don't need to run it again after a fresh load. Run it standalone when you want to re-assert the schema without re-importing — e.g. after restoring from the `neo4j_data.tar.zst` snapshot. Creates uniqueness constraints (`Concept.cui`, `Atom.aui`, `SemanticType.tui`, `Source.sab`), a range index on `(Atom.sab, Atom.code)` and `Concept.name`, full-text indexes `concept_name_fts` and `atom_str_fts`, and applies the four `:ClinicalCore` / `:ClinicalSupport` / `:ClinicalDiscipline` / `:Peripheral` tier labels.
+
+### 5. Clean MTSamples (drop empty transcripts, dedupe cross-filings)
 
 ```bash
 python python/ingestion/mtsamples/clean_mtsamples.py
@@ -110,7 +118,7 @@ python python/ingestion/mtsamples/clean_mtsamples.py
 
 MTSamples cross-files the same note under multiple `medical_specialty` tags with byte-identical `transcription`. This step drops rows with no transcription, collapses duplicate transcriptions (keeping first-row metadata, recording dropped specialty names in `alt_specialties`, and unioning keyword tokens), and writes the survivors to `data/mtsamples_clean.jsonl`. Expected: **4,966 raw rows → 2,357 cleaned records** (2,150 clusters collapsed, 2,609 dupe rows dropped).
 
-### 5. Parse MTSamples into per-doc JSON
+### 6. Parse MTSamples into per-doc JSON
 
 Splits each cleaned transcription on ALL-CAPS `HEADING:` tokens and emits one `MTSampleDoc` JSON per row into `data/mtsamples_docs/`. These intermediates are what the embedding step in `python/ingestion/mtsamples/embed_sections.py` consumes.
 
@@ -124,7 +132,7 @@ python python/ingestion/mtsamples/parse_mtsamples.py [--workers 16]
 
 Result: **2,357 per-doc JSONs** under `data/mtsamples_docs/{doc_id:04d}.json`. Each doc carries `doc_id`, `specialty`, `specialty_cui`, `doctype_cui` (explicit mapping or heuristic rule), `sample_name`, merged `keywords`, `alt_specialties` (list of `{specialty, specialty_cui, doctype_cui}` from the dropped cross-filings — every entry has at least one CUI populated), and a list of `Section` records (`chunk_id`, `section_type`, `text`, plus placeholders for `embedding` and `entities` populated downstream). `doctype_cui` is set on 1,634/2,357 docs (specialties without an explicit mapping in `data/doctype_cui.json` and no matching heading rule get `""`).
 
-### 6. Build per-section abbreviation maps (Schwartz-Hearst + override + LRABR-augmented + MedTE WSD [+ optional BioLORD ensemble])
+### 7. Build per-section abbreviation maps (Schwartz-Hearst + override + LRABR-augmented + MedTE WSD [+ optional BioLORD ensemble])
 
 Three-stage resolution **per Section**, not per doc. Each Section gets `abbreviations`, `abbreviations_source` (`sh`/`override`/`lrabr`), and `abbreviations_score` (1.0 for S-H and override, cosine similarity for LRABR) written into the per-doc JSON. The same surface form can resolve to different expansions in different sections of the same doc — useful when one note mixes topics (e.g. `MS` could mean mitral stenosis in `PROCEDURE` and multiple sclerosis in `HPI` of the same doc; the section text is what disambiguates).
 
@@ -149,7 +157,7 @@ python python/ingestion/mtsamples/build_abbreviations.py [--min-score 0.35] [--e
 
 BioLORD's cosine floor for this task is intentionally close to MedTE's, not the 0.7 used for concept-to-concept linking in step 17 — narrative-to-concept scores live in a much lower distribution for BioLORD because it was trained on concept↔synonym pairs, not long-prose-to-concept alignment (see `scripts/compare_abbrev_wsd.py` for the full analysis).
 
-Expected on MTSamples (each config overwrites the per-doc JSONs; cascade step 8+ to propagate):
+Expected on MTSamples (each config overwrites the per-doc JSONs; cascade step 9+ to propagate):
 
 | config | LRABR picks | sections w/ abbrev |
 |---|---:|---:|
@@ -159,7 +167,7 @@ Expected on MTSamples (each config overwrites the per-doc JSONs; cascade step 8+
 
 S-H (135) and override (2,799) are the same across all three configs. The ~718 picks removed by the 0.35 threshold are the noise band of weak MedTE hits; the additional ~1,438 filtered by `--ensemble` are borderline MedTE picks where BioLORD withholds concurrence. `--ensemble` is opt-in for users who prioritize precision over coverage; the default behavior is MedTE-only with the bumped threshold plus the augment.
 
-### 7. Extract per-section entities with spans (Stanza i2b2 NER)
+### 8. Extract per-section entities with spans (Stanza i2b2 NER)
 
 ```bash
 # GPU path (fastest): if host cuDNN lags torch's bundled cuDNN, prepend the venv's
@@ -175,7 +183,7 @@ python python/ingestion/mtsamples/extract_section_entities.py --cpu
 
 Runs Stanza's `mimic/i2b2` NER over each Section's text (sections are the logical unit — not Qdrant-aligned windows) and fills each Section's `entities` list in the per-doc JSON. Each entity record carries `surface_text` (literal section-text slice), `recognized_text` (Stanza's output), i2b2 `type` (`PROBLEM` / `TEST` / `TREATMENT`), and section-local `start_char` / `end_char`.
 
-**This step is deliberately idempotent and text-normalization-free.** All derived text fields (`resolved_text`, `expanded_text`) are computed in step 8 from these raw records, so iterating on normalization rules doesn't require re-running Stanza.
+**This step is deliberately idempotent and text-normalization-free.** All derived text fields (`resolved_text`, `expanded_text`) are computed in step 9 from these raw records, so iterating on normalization rules doesn't require re-running Stanza.
 
 Parallelism uses `multiprocessing.Pool` with `spawn` start method so each worker gets a clean CUDA context; doc paths are sharded via **Longest-Processing-Time-first bin packing** on total section char-count (keeps the heaviest shard within ~4/3 of the mean, vs equal-doc-count sharding that lumped several 2K-token PROCEDURE notes together and stretched wall time by 30%+). Within each worker, sections are **length-sorted descending** before batching so Stanza's padding-to-longest-in-batch waste is near-zero on a corpus with p50=23 / p99=863 / max=2,819 MedTE tokens.
 
@@ -187,19 +195,19 @@ Expected on MTSamples: **~121K entities across ~18K non-empty sections in ~91s o
 
 This is distinct from `python/ingestion/mtsamples/extract_entities.py`, which targets Qdrant-aligned chunk windows for the retrieval pipeline. The two produce complementary artifacts: section entities live inside the per-doc JSON (coarse-grained, directly usable by the Neo4j loader's Section→Entity layer), while chunk entities live in `data/entities/chunk_entities.jsonl` and key off `chunk_id` for joins with Qdrant points.
 
-### 8. Normalize per-section entities (strip articles + expand abbreviations)
+### 9. Normalize per-section entities (strip articles + expand abbreviations)
 
 ```bash
 python python/ingestion/mtsamples/normalize_section_entities.py
 ```
 
-Derives two text fields per entity record from the `recognized_text` written by step 7:
+Derives two text fields per entity record from the `recognized_text` written by step 8:
 - `resolved_text` — `recognized_text` with articles (`a`/`an`/`the`) removed and whitespace collapsed. Reserved as the NER canonical surface; future string-level normalization rules chain in here.
-- `expanded_text` — `resolved_text` with known abbreviations substituted using the doc's `abbreviations` map (step 6), then article-stripped again in case the expansion introduced one. Use this for UMLS/Neo4j grounding and dense-retrieval keying, where the expanded form matches more Concept atoms.
+- `expanded_text` — `resolved_text` with known abbreviations substituted using the doc's `abbreviations` map (step 7), then article-stripped again in case the expansion introduced one. Use this for UMLS/Neo4j grounding and dense-retrieval keying, where the expanded form matches more Concept atoms.
 
 Pure Python string work — no GPU, no heavy compute. **Typically finishes in ~2s over all 18K entities**, vs the ~91s cost of re-running NER. That's the payoff of keeping the layers separate: iterate on the stopword list, the token regex, or any new normalization rule in a fast edit-run-inspect loop without paying the NER tax each time. Expected on MTSamples: **~32K entities get an article stripped (26%)**, **~4K entities (3.4%)** get an abbrev expansion that changes `expanded_text` relative to `resolved_text`.
 
-### 9. Link specialties to UMLS CUIs
+### 10. Link specialties to UMLS CUIs
 
 ```bash
 python python/ingestion/mtsamples/link_specialty_to_cui.py
@@ -209,7 +217,7 @@ Resolves both `doc['specialty']` and every `doc['alt_specialties'][i]['specialty
 
 Expected: all 40 unique specialty strings resolve (~0.3s); ~1,400 alt_specialty entries get updated CUIs across ~1,270 docs.
 
-### 10. Link section types to UMLS CUIs
+### 11. Link section types to UMLS CUIs
 
 ```bash
 python python/ingestion/mtsamples/link_sections_to_cui.py
@@ -219,7 +227,7 @@ For every Section's `section_type`, applies a small alias map (`HPI` → `histor
 
 Expected: **~1,736/1,778 unique section_type values resolved (97.6%)**; `HPI` and `HISTORY OF PRESENT ILLNESS` both → `C0262512`. ~52s on a warm Neo4j.
 
-### 11. Link entities to UMLS CUIs + TUIs (dask map-reduce)
+### 12. Link entities to UMLS CUIs + TUIs (dask map-reduce)
 
 ```bash
 python python/ingestion/mtsamples/link_entities_to_cui.py [--workers 16] [--batch 500]
@@ -250,13 +258,13 @@ Fields written per entity:
 
 Expected on MTSamples: **~119K of 121K entities linked (~98%)**, 100% of linked entities carry ≥1 TUI. Top semantic types across the corpus: **T033 Finding (16.6K), T061 Therapeutic/Preventive Procedure (13.8K), T047 Disease or Syndrome (12.6K), T074 Medical Device (9.9K), T121 Pharmacologic Substance (8.9K), T184 Sign or Symptom (8.3K)** — i.e. the distribution a clinical corpus should produce.
 
-### 12. Snapshot the lexical entity→CUI map for later comparison
+### 13. Snapshot the lexical entity→CUI map for later comparison
 
 ```bash
 python python/ingestion/mtsamples/export_entity_cui_lexical.py
 ```
 
-Step 11 resolves entities lexically — exact `Atom.str_norm` match plus a Lucene fulltext fallback on `concept_name_fts`. To make it easy to A/B against a future **semantic** variant (e.g. BioLORD-2023 nearest-neighbor over Concept name embeddings), this step dumps one JSONL line per unique `expanded_text` with the CUI that the lexical pipeline picked:
+Step 12 resolves entities lexically — exact `Atom.str_norm` match plus a Lucene fulltext fallback on `concept_name_fts`. To make it easy to A/B against a future **semantic** variant (e.g. BioLORD-2023 nearest-neighbor over Concept name embeddings), this step dumps one JSONL line per unique `expanded_text` with the CUI that the lexical pipeline picked:
 
 ```json
 {"text": "acute myocardial infarction", "cui": "C0155626"}
@@ -264,13 +272,13 @@ Step 11 resolves entities lexically — exact `Atom.str_norm` match plus a Lucen
 
 Unresolved entities are preserved with `cui: ""` so the snapshot is a complete coverage map, not just the hits. Expected on MTSamples: **49,390 unique entities → 48,102 linked / 1,288 unlinked** written to `data/entity_cui_lexical.jsonl` in ~1s. Re-run the same export after swapping in a semantic linker and diff the two files to see exactly which entities move.
 
-### 13. Sentence-chunk sections + tag each sentence with linked entity sets
+### 14. Sentence-chunk sections + tag each sentence with linked entity sets
 
 ```bash
 python python/ingestion/mtsamples/chunk_sentences.py [--workers 8] [--batch 128]
 ```
 
-For every Section, splits the text into sentences using **Stanza's `mimic` clinical tokenizer** (same tokenizer used by step 7 for NER — handles medical abbreviations like `q.i.d.`, `2.5 mg`, `Dr.`, and does better on MTSamples' comma-pseudo-paragraph style than a bare regex). For each sentence, scans for the presence of any linked entity's surface form (word-boundary, case-insensitive) via a single compiled alternation regex per doc. Matched entities contribute to three per-sentence sets:
+For every Section, splits the text into sentences using **Stanza's `mimic` clinical tokenizer** (same tokenizer used by step 8 for NER — handles medical abbreviations like `q.i.d.`, `2.5 mg`, `Dr.`, and does better on MTSamples' comma-pseudo-paragraph style than a bare regex). For each sentence, scans for the presence of any linked entity's surface form (word-boundary, case-insensitive) via a single compiled alternation regex per doc. Matched entities contribute to three per-sentence sets:
 
 - `cuis` — sorted list of UMLS CUIs covered in this sentence
 - `tuis` — sorted list of semantic TUIs in this sentence
@@ -278,18 +286,18 @@ For every Section, splits the text into sentences using **Stanza's `mimic` clini
 
 Written back as `section.sentences = [{text, cuis, tuis, surface_forms}, ...]`.
 
-Parallelism is `mp.Pool` with `spawn` start method (same pattern as step 7). Each worker loads Stanza once in its initializer and processes its shard's sections in batches of `--batch` via `nlp.bulk_process`. Per-doc surface-form indices are compiled once per doc and reused across all sections of that doc, so a sentence is scanned against all candidate surface forms in one pass.
+Parallelism is `mp.Pool` with `spawn` start method (same pattern as step 8). Each worker loads Stanza once in its initializer and processes its shard's sections in batches of `--batch` via `nlp.bulk_process`. Per-doc surface-form indices are compiled once per doc and reused across all sections of that doc, so a sentence is scanned against all candidate surface forms in one pass.
 
 Expected on MTSamples: **~83K sentences across 18K sections in ~20s wall on L4 (8 workers, batch=128)**; ~74% of sentences carry ≥1 CUI hit. Stanza catches ~800 more sentence boundaries than the naive regex, mostly in operative-note comma-joined clauses.
 
-### 14. Embed sentence-level chunks into Qdrant
+### 15. Embed sentence-level chunks into Qdrant
 
 ```bash
 docker compose up -d medte qdrant
 python python/ingestion/mtsamples/embed_sentences.py [--workers 16] [--batch 32] [--recreate]
 ```
 
-Embeds each sentence chunk (produced by step 13) via MedTE/TEI and upserts one Qdrant point per sentence into the `mtsamples_sentences` collection. Point id is `uuid5(chunk_id)` so re-runs are idempotent. Parallelism is `mp.Pool` — each worker owns an HTTP session + Qdrant client; TEI does server-side dynamic batching across concurrent worker requests.
+Embeds each sentence chunk (produced by step 14) via MedTE/TEI and upserts one Qdrant point per sentence into the `mtsamples_sentences` collection. Point id is `uuid5(chunk_id)` so re-runs are idempotent. Parallelism is `mp.Pool` — each worker owns an HTTP session + Qdrant client; TEI does server-side dynamic batching across concurrent worker requests.
 
 **Payload carries full provenance** (all fields payload-indexed): `chunk_id`, `section_chunk_id`, `doc_id`, `section_type`, `section_cui`, `specialty`, `specialty_cui`, `alt_specialty_cuis`, `doctype_cui`, `cuis`, `tuis`, `surface_forms`, `text`. Enables index-only filters like *"sentences in General Medicine notes, HPI section, mentioning C0001175"* before any vector search.
 
@@ -307,14 +315,6 @@ Embeds each sentence chunk (produced by step 13) via MedTE/TEI and upserts one Q
 
 Expected on MTSamples: **~83K sentences embedded + upserted in ~16s wall**. Collection is configured with `cosine` distance and `indexing_threshold=100` so segments get indexed promptly (default would leave small segments unindexed, falling back to brute-force search).
 
-### 15. Create Neo4j constraints, indexes, and tier labels
-
-```bash
-bash scripts/create_neo4j_indices.sh
-```
-
-`scripts/load_neo4j.sh` calls this automatically at the end of the bulk-import step, so you don't need to run it again after a fresh load. Run it standalone when you want to re-assert the schema without re-importing — e.g. after restoring from the `neo4j_data.tar.zst` snapshot. Creates uniqueness constraints (`Concept.cui`, `Atom.aui`, `SemanticType.tui`, `Source.sab`), a range index on `(Atom.sab, Atom.code)` and `Concept.name`, full-text indexes `concept_name_fts` and `atom_str_fts`, and applies the four `:ClinicalCore` / `:ClinicalSupport` / `:ClinicalDiscipline` / `:Peripheral` tier labels.
-
 ### 16. (Experimental) Build the BioLORD-2023 UMLS Concept index
 
 Two interchangeable variants — both write to the same `umls_concepts_biolord` Qdrant collection with the same `uuid5(cui)` point ids, so one can pick up where the other left off via the shared `data/biolord_concept_index.state` resume file.
@@ -326,7 +326,7 @@ docker compose up -d biolord qdrant neo4j
 python python/ingestion/umls/build_biolord_concept_index.py [--workers 8] [--batch 64] [--resume]
 ```
 
-Embeds every `Concept.name` via BioLORD-2023 (served by a second TEI container on `localhost:8081`, `--pooling=mean` — BioLORD is a sentence-transformers model trained with mean-pooled + L2-normalized vectors, same as MedTE). Payload: `{cui, name}`. Neo4j is streamed in `--page-size` (default 20,000) keyset-paginated pages on `cui ASC`; each page is **LPT-first size-balanced** across `--workers` mp.Pool processes (one biolord HTTP session + one Qdrant client per worker), and within each shard items are **length-sorted descending before batching** so padding-to-longest waste in the forward pass is near-zero (same pattern as step 7's Stanza NER).
+Embeds every `Concept.name` via BioLORD-2023 (served by a second TEI container on `localhost:8081`, `--pooling=mean` — BioLORD is a sentence-transformers model trained with mean-pooled + L2-normalized vectors, same as MedTE). Payload: `{cui, name}`. Neo4j is streamed in `--page-size` (default 20,000) keyset-paginated pages on `cui ASC`; each page is **LPT-first size-balanced** across `--workers` mp.Pool processes (one biolord HTTP session + one Qdrant client per worker), and within each shard items are **length-sorted descending before batching** so padding-to-longest waste in the forward pass is near-zero (same pattern as step 8's Stanza NER).
 
 Sweep on L4 (8 workers, 40 K-concept sample, LPT-balanced shards) picked **8 × batch 64 at ~2,000/s** as the knee — beats 16×64 because extra workers only add TEI-queue contention, beats batch 128 by <1%, beats batch 256 by ~2× (at 256 TEI's dynamic batcher can't re-pack effectively). The script has a 30-retry / 8 s-max-delay backoff on HTTP 429 so transient saturation never kills the run.
 
@@ -338,7 +338,7 @@ docker compose up -d qdrant neo4j
 python python/ingestion/umls/build_biolord_concept_index_local.py [--batch 1024] [--resume] [--half]
 ```
 
-Loads BioLORD directly via `sentence-transformers` on the host GPU, streams concepts page-by-page from Neo4j, length-sorts each page, runs a single chunked forward pass at `--batch`, and upserts to Qdrant over **gRPC** (port 6334). No HTTP/JSON round-trips between Python and the embedder — every vector stays on-device until the batch is done, which typically gives 2–3× the TEI-variant throughput on the same hardware. Requires the venv's CUDA torch (already present for step 7's Stanza GPU path; `python -c 'import torch; print(torch.cuda.is_available())'`). `--half` casts the model to fp16 for another ~2× at a tiny numeric delta (BioLORD was trained fp32).
+Loads BioLORD directly via `sentence-transformers` on the host GPU, streams concepts page-by-page from Neo4j, length-sorts each page, runs a single chunked forward pass at `--batch`, and upserts to Qdrant over **gRPC** (port 6334). No HTTP/JSON round-trips between Python and the embedder — every vector stays on-device until the batch is done, which typically gives 2–3× the TEI-variant throughput on the same hardware. Requires the venv's CUDA torch (already present for step 8's Stanza GPU path; `python -c 'import torch; print(torch.cuda.is_available())'`). `--half` casts the model to fp16 for another ~2× at a tiny numeric delta (BioLORD was trained fp32).
 
 Both variants persist the last successfully-upserted CUI to `data/biolord_concept_index.state` after every page, so `--resume` is safe to re-run across variants. One-time cost on MTSamples-scale UMLS (~3.3 M concepts × 768-d): variant A ~30 min, variant B ~10–15 min with `--half`. The collection is the search side of the comparison in step 17.
 
@@ -349,20 +349,20 @@ docker compose up -d biolord qdrant
 python python/ingestion/mtsamples/link_entities_to_cui_biolord.py [--workers 16] [--batch 32] [--min-score 0.7]
 ```
 
-Semantic counterpart to step 11. Dedups the same universe of unique `expanded_text` values across `data/mtsamples_docs/*.json`, embeds each via BioLORD on `:8081`, and does a top-1 nearest-neighbor search against `umls_concepts_biolord` (built in step 16). Writes `data/entity_cui_biolord.jsonl`:
+Semantic counterpart to step 12. Dedups the same universe of unique `expanded_text` values across `data/mtsamples_docs/*.json`, embeds each via BioLORD on `:8081`, and does a top-1 nearest-neighbor search against `umls_concepts_biolord` (built in step 16). Writes `data/entity_cui_biolord.jsonl`:
 
 ```json
 {"text": "subpectoral pocket", "cui": "C0229909", "cui_name": "Pectoral region structure", "score": 0.81}
 ```
 
-The `text` + `cui` columns diff directly against `data/entity_cui_lexical.jsonl` (step 12), so the delta between the two linkers is a one-line `join`. Below-threshold hits (cosine < `--min-score`) are written with `cui: ""` so the snapshot stays a complete coverage map rather than only the matches.
+The `text` + `cui` columns diff directly against `data/entity_cui_lexical.jsonl` (step 13), so the delta between the two linkers is a one-line `join`. Below-threshold hits (cosine < `--min-score`) are written with `cui: ""` so the snapshot stays a complete coverage map rather than only the matches.
 
 **Why we expect BioLORD to win where lexical loses.** The lexical linker scores candidate Concepts by BM25-style token overlap on the entity string in isolation, so `"copious irrigation"` resolves to `Copious` (the one-word finding literally named that) instead of the `Irrigation` procedure, and `"subpectoral pocket"` resolves to `Periodontal Pocket` on the `pocket` token even though the sentence is about chest-wall anatomy. BioLORD-2023 is fine-tuned on UMLS synonym and definition contrastive pairs, so semantically related Concepts cluster in the embedding space and lexically-similar-but-semantically-distant ones do not — the nearest neighbor of `"subpectoral pocket"` sits in the pectoral-region cluster, not the dental one.
 
 **Scope of v1.**
-- Snapshot-only — does not write back into per-doc JSONs. Audit the diff before deciding whether to rewire the main pipeline (steps 13–14 still consume step 11's lexical CUIs in-place).
+- Snapshot-only — does not write back into per-doc JSONs. Audit the diff before deciding whether to rewire the main pipeline (steps 14–15 still consume step 12's lexical CUIs in-place).
 - Embeds each entity in isolation for apples-to-apples comparison with the lexical linker. A follow-up can pass the enclosing sentence as context for additional lift on polysemous mentions.
-- TUIs are not re-fetched; derive them from the resolved CUIs via the same `HAS_SEMTYPE` pass as step 11 phase 4 if/when needed.
+- TUIs are not re-fetched; derive them from the resolved CUIs via the same `HAS_SEMTYPE` pass as step 12 phase 4 if/when needed.
 
 ### 18. (Experimental) Hybrid linker — exact `Atom.str_norm` + BioLORD NN fallback
 
@@ -371,11 +371,11 @@ docker compose up -d biolord qdrant neo4j
 python python/ingestion/mtsamples/link_entities_to_cui_hybrid.py [--workers 8] [--batch 64] [--min-score 0.7]
 ```
 
-Production-shape linker that combines the best of steps 11 and 17, informed by the diff between them:
+Production-shape linker that combines the best of steps 12 and 17, informed by the diff between them:
 
-1. **Phase A** — exact `Atom.str_norm` via Neo4j (same query as step 11 phase 2). Strictly wins on abbreviations and short polysemous surfaces (`tah/bso`, `djd`, `hjr`, `ca`, `stylet`, `cold`) because BioLORD's embedding space doesn't co-locate abbreviations with their expansions.
+1. **Phase A** — exact `Atom.str_norm` via Neo4j (same query as step 12 phase 2). Strictly wins on abbreviations and short polysemous surfaces (`tah/bso`, `djd`, `hjr`, `ca`, `stylet`, `cold`) because BioLORD's embedding space doesn't co-locate abbreviations with their expansions.
 2. **Phase B** — BioLORD-2023 nearest-neighbor via `umls_concepts_biolord` (same search as step 17) on the residual hashes. Beats Lucene fulltext on descriptive phrases whose token overlap misleads BM25: `"copious irrigation"` → `Therapeutic Irrigation` instead of the one-word `Copious` finding, `"sentinel node dissection"` → `Excision of sentinel lymph node` instead of a weaker lex hit.
-3. **Phase C** — TUI enrichment via Neo4j, identical to step 11 phase 4.
+3. **Phase C** — TUI enrichment via Neo4j, identical to step 12 phase 4.
 
 Output: `data/entity_cui_hybrid.jsonl`:
 
@@ -386,6 +386,6 @@ Output: `data/entity_cui_hybrid.jsonl`:
 
 The `cui_match` field records provenance (`"exact"` vs `"biolord/<cosine>"`) so downstream consumers can filter on confidence. Below-threshold hits are preserved with `cui: ""` so the snapshot stays a complete coverage map.
 
-Expected on MTSamples (L4, 8 workers × batch 64, gRPC to Qdrant): **49,390 unique entities; 10,900 exact (22.1%) + 34,838 BioLORD ≥ 0.7 (70.5%) + 3,652 unresolved; ~34s wall including TUI pass**. Compared to step 11's lexical-only baseline at 48,102 linked (97.4%), the hybrid trades ~4.8pp of coverage for the precision wins on descriptive phrases — most of the gap is low-confidence Lucene fulltext hits (score ≥ 5) where BioLORD's best neighbor sits below 0.7 and the match is probably spurious. Drop `--min-score 0.6` to narrow the gap if coverage matters more than precision.
+Expected on MTSamples (L4, 8 workers × batch 64, gRPC to Qdrant): **49,390 unique entities; 10,900 exact (22.1%) + 34,838 BioLORD ≥ 0.7 (70.5%) + 3,652 unresolved; ~34s wall including TUI pass**. Compared to step 12's lexical-only baseline at 48,102 linked (97.4%), the hybrid trades ~4.8pp of coverage for the precision wins on descriptive phrases — most of the gap is low-confidence Lucene fulltext hits (score ≥ 5) where BioLORD's best neighbor sits below 0.7 and the match is probably spurious. Drop `--min-score 0.6` to narrow the gap if coverage matters more than precision.
 
-**Next step (not implemented in v1).** This linker is snapshot-only; a companion writeback pass would lift each per-section `entity.cui` from `data/entity_cui_hybrid.jsonl` back into `data/mtsamples_docs/*.json`, replacing step 11's lexical assignments and triggering a rebuild of steps 13–14 (sentence payloads in Qdrant). Do that once the diff against the lexical baseline has been spot-audited.
+**Next step (not implemented in v1).** This linker is snapshot-only; a companion writeback pass would lift each per-section `entity.cui` from `data/entity_cui_hybrid.jsonl` back into `data/mtsamples_docs/*.json`, replacing step 12's lexical assignments and triggering a rebuild of steps 14–15 (sentence payloads in Qdrant). Do that once the diff against the lexical baseline has been spot-audited.
